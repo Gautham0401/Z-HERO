@@ -14,3 +14,19 @@ venv/ # Virtual environment folder
 *.sqlite3 # If you use SQLite for dev DB
 test_results/ # If you have a specific folder for test outcomes
 .mypy_cache/ # Mypy cache
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.env
+.pytest_cache/
+.vscode/
+.idea/
+.DS_Store # Mac specific
+venv/ # Virtual environment folder
+.venv/ # Another common virtual environment folder
+*.log
+*.sqlite3 # If you use SQLite for dev DB
+test_results/ # If you have a specific folder for test outcomes
+.mypy_cache/ # Mypy cache
