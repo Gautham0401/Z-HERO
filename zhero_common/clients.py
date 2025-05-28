@@ -2,7 +2,7 @@
 import httpx
 from zhero_common.config import AGENT_ENDPOINTS, TOOL_ENDPOINTS, logger
 from fastapi import HTTPException
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional # Added Optional
 from tenacity import (
     retry, wait_exponential, stop_after_attempt, retry_if_exception_type,
     CircuitBreakerError, before_sleep_log
@@ -39,12 +39,13 @@ class AgentClient:
         before_sleep=before_sleep_log(tenacity_logger, logging.INFO),
         reraise=True
     )
-    async def _post_with_retry_logic(self, service_name: str, full_url: str, json_data: Dict[str, Any]):
+    async def _post_with_retry_logic(self, service_name: str, full_url: str, json_data: Dict[str, Any], request_id: Optional[str]):
+        headers = {"X-Request-ID": request_id} if request_id else None # NEW: Add X-Request-ID header
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(full_url, json=json_data)
+                response = await client.post(full_url, json=json_data, headers=headers) # NEW: Pass headers
                 if 400 <= response.status_code < 500:
-                    tenacity_logger.error(f"AgentClient: Non-retryable 4xx error from {service_name} ({full_url}): {response.status_code} - {response.text}")
+                    tenacity_logger.error(f"[Request-ID: {request_id}] AgentClient: Non-retryable 4xx error from {service_name} ({full_url}): {response.status_code} - {response.text}")
                     raise httpx.HTTPStatusError(
                         f"Non-retryable client error: {response.text}",
                         request=response.request,
@@ -53,55 +54,58 @@ class AgentClient:
                 response.raise_for_status()
                 return response.json()
         except httpx.HTTPStatusError as e:
-            tenacity_logger.error(f"AgentClient: HTTPStatusError from {service_name} ({full_url}): {e.response.status_code} - {e.response.text}", exc_info=True)
+            tenacity_logger.error(f"[Request-ID: {request_id}] AgentClient: HTTPStatusError from {service_name} ({full_url}): {e.response.status_code} - {e.response.text}", exc_info=True)
             raise ZHeroDependencyError(
                 agent_name="AgentClient",
                 dependency=service_name,
                 message=f"HTTP Error {e.response.status_code}",
                 status_code=e.response.status_code,
-                original_error=e.response.text
+                original_error=e.response.text,
+                details={"request_id": request_id} # NEW: Add request_id to error details
             )
         except httpx.RequestError as e:
-            tenacity_logger.error(f"AgentClient: RequestError (network/timeout) from {service_name} ({full_url}): {e}", exc_info=True)
+            tenacity_logger.error(f"[Request-ID: {request_id}] AgentClient: RequestError (network/timeout) from {service_name} ({full_url}): {e}", exc_info=True)
             raise ZHeroDependencyError(
                 agent_name="AgentClient",
                 dependency=service_name,
                 message=f"Network/Connection error: {e}",
                 status_code=503,
-                original_error=str(e)
+                original_error=str(e),
+                details={"request_id": request_id} # NEW: Add request_id to error details
             )
 
-    async def post(self, service_name: str, path: str, json_data: Dict[str, Any]):
+    async def post(self, service_name: str, path: str, json_data: Dict[str, Any], request_id: Optional[str] = None): # NEW param: request_id
         base_url = self.endpoint_map.get(service_name)
         if not base_url:
-            logger.error(f"AgentClient: Unknown service name: {service_name}")
-            raise ZHeroAgentError("AgentClient", f"Unknown service '{service_name}' in endpoint map.", 500)
+            logger.error(f"[Request-ID: {request_id}] AgentClient: Unknown service name: {service_name}")
+            raise ZHeroAgentError("AgentClient", f"Unknown service '{service_name}' in endpoint map.", 500, details={"request_id": request_id}) # NEW: Add request_id
 
         full_url = f"{base_url}{path}"
 
         if self._circuit_breakers.get(service_name):
-            logger.warning(f"AgentClient: Circuit breaker is OPEN for {service_name}. Failing fast.")
+            logger.warning(f"[Request-ID: {request_id}] AgentClient: Circuit breaker is OPEN for {service_name}. Failing fast.")
             raise ZHeroDependencyError(
                 agent_name="AgentClient",
                 dependency=service_name,
                 message=f"Circuit breaker is open for {service_name}. Try again later.",
-                status_code=503
+                status_code=503,
+                details={"request_id": request_id} # NEW: Add request_id
             )
 
         try:
-            result = await self._post_with_retry_logic(service_name, full_url, json_data)
+            result = await self._post_with_retry_logic(service_name, full_url, json_data, request_id) # NEW: Pass request_id
             if self._circuit_breakers.get(service_name):
-                logger.info(f"AgentClient: Circuit breaker for {service_name} closed due to success.")
+                logger.info(f"[Request-ID: {request_id}] AgentClient: Circuit breaker for {service_name} closed due to success.")
                 self._circuit_breakers[service_name] = False
             return result
         except ZHeroDependencyError as e:
             if e.status_code >= 500:
                 self._circuit_breakers[service_name] = True
-                logger.error(f"AgentClient: Circuit breaker OPENED for {service_name} due to repeated failures.")
+                logger.error(f"[Request-ID: {request_id}] AgentClient: Circuit breaker OPENED for {service_name} due to repeated failures.")
             raise
         except Exception as e:
-            logger.error(f"AgentClient: Unexpected non-ZHero exception calling {service_name} ({full_url}): {e}", exc_info=True)
-            raise ZHeroException(f"An unexpected error occurred during call to {service_name}", 500, str(e))
+            logger.error(f"[Request-ID: {request_id}] AgentClient: Unexpected non-ZHero exception calling {service_name} ({full_url}): {e}", exc_info=True)
+            raise ZHeroException(f"An unexpected error occurred during call to {service_name}", 500, str(e), details={"request_id": request_id}) # NEW: Add request_id
 
 agent_client = AgentClient(AGENT_ENDPOINTS)
 tool_client = AgentClient(TOOL_ENDPOINTS)

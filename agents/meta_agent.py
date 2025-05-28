@@ -312,4 +312,4 @@ async def periodic_self_reflection_task():
         except Exception as e:
             logger.error(f"Meta-Agent (Periodic): Error during scheduled self-reflection (unexpected error): {e}", exc_info=True)
 
-        await asyncio.sleep(60 * 60 * 24)  # Run every 24 hours
+        await asyncio.sleep(60 * 60 * 24)
