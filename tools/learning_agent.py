@@ -1,4 +1,5 @@
 # tools/learning_agent.py
+
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from typing import Dict, Any, List, Optional
@@ -14,10 +15,10 @@ from langchain_google_vertexai import ChatVertexAI
 from zhero_common.config import logger, os
 from zhero_common.models import ( # UPDATED IMPORTS
     LearningTrigger, KnowledgeGap, SearchRequest, KnowledgeItem, WebSearchResult,
-    AgentPerformanceMetric # For Pub/Sub logging
+    AgentPerformanceMetric, MarkGapAsAddressedRequest, GetKnowledgeGapsRequest # For updating gap status
 )
 from zhero_common.clients import agent_client, supabase
-from zhero_common.crew_tools import (
+from zhero_common.crew_tools import ( # KEPT, as these are CrewAI Tool wrappers
     WebSearchTool, SummarizationTool, IngestKnowledgeItemTool,
     SemanticKnowledgeSearchTool, LogInternalKnowledgeGapTool
 )
@@ -28,6 +29,8 @@ from zhero_common.exceptions import (
 )
 # NEW: Pub/Sub Publisher instance
 from zhero_common.pubsub_client import pubsub_publisher, initialize_pubsub_publisher
+# NEW: Import metrics helper
+from zhero_common.metrics import log_performance_metric, PerformanceMetricName # <--- NEW
 
 
 app = FastAPI(title="Learning Agent")
@@ -57,7 +60,7 @@ crew_llm_instance: Optional[ChatVertexAI] = None
 @app.on_event("startup")
 async def startup_event():
     global crew_llm_instance
-    # Initialize Pub/Sub Publisher
+    # Initialize Pub/Sub Publisher (this is crucial for metric logging!)
     await initialize_pubsub_publisher()
 
     try:
@@ -67,8 +70,22 @@ async def startup_event():
             location=os.environ["VERTEX_AI_LOCATION"]
         )
         logger.info("Learning Agent: Initialized CrewAI LLM (ChatVertexAI).")
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="learning_agent",
+                metric_name=PerformanceMetricName.AGENT_STARTUP_SUCCESS,
+                context={"model": os.environ["GEMINI_PRO_MODEL_ID"], "component": "crewai_llm"}
+            )
+        )
     except Exception as e:
         logger.error(f"Learning Agent: Failed to initialize CrewAI LLM (ChatVertexAI): {e}", exc_info=True)
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="learning_agent",
+                metric_name=PerformanceMetricName.AGENT_STARTUP_FAILURE,
+                context={"model": os.environ["GEMINI_PRO_MODEL_ID"], "component": "crewai_llm", "error": str(e)}
+            )
+        )
         raise ZHeroVertexAIError("LearningAgent", "CrewAI LLM", "Failed to initialize CrewAI LLM on startup.", original_error=e)
 
     # Optionally, schedule a periodic knowledge review task (can trigger CrewAI)
@@ -86,11 +103,12 @@ async def trigger_learning(trigger: LearningTrigger): # Uses Pydantic model for 
         raise ZHeroInvalidInputError(message="User ID and trigger type are required for learning trigger.")
     if trigger.trigger_type == "knowledge_gap" and not trigger.details:
         raise ZHeroInvalidInputError(message="Details are required for 'knowledge_gap' trigger type.")
-    if pubsub_publisher is None:
-        logger.warning("Learning Agent: Pub/Sub publisher not initialized. Performance metrics won't be logged or complex gaps published.")
-
+    # pubsub_publisher check is now handled gracefully within log_performance_metric
+    # if pubsub_publisher is None:
+    #     logger.warning("Learning Agent: Pub/Sub publisher not initialized. Performance metrics won't be logged or complex gaps published.")
 
     logger.info(f"Learning Agent: Received learning trigger: '{trigger.trigger_type}' for user {trigger.user_id}")
+    start_time = datetime.datetime.now() # <--- NEW
     try:
         crew_result_str: Optional[str] = None
         if trigger.trigger_type == "knowledge_gap":
@@ -112,18 +130,29 @@ async def trigger_learning(trigger: LearningTrigger): # Uses Pydantic model for 
             else:
                 logger.info(f"Learning Agent: Performing simple research for gap '{query}'.")
                 
+                research_call_start = datetime.datetime.now() # <--- NEW
                 web_results_list_json = await agent_client.post(
                     "research_agent",
                     "/perform_research",
                     SearchRequest(user_id=user_id, query=query, num_results=5).model_dump(exclude_unset=True) # Pass Pydantic
                 )
                 web_results_list = [WebSearchResult(**r) for r in web_results_list_json]
-
+                research_call_end = datetime.datetime.now() # <--- NEW
+                research_duration_ms = (research_call_end - research_call_start).total_seconds() * 1000 # <--- NEW
+                asyncio.create_task( # <--- NEW
+                    log_performance_metric(
+                        agent_name="learning_agent",
+                        metric_name=PerformanceMetricName.AGENT_API_CALL_SUCCESS, # <--- NEW
+                        value=1.0, user_id=user_id,
+                        context={"target_agent": "research_agent", "endpoint": "/perform_research", "duration_ms": research_duration_ms}
+                    )
+                )
 
                 if web_results_list:
                     logger.info(f"Learning Agent: Simple research found {len(web_results_list)} results. Initiating direct ingestion.")
                     ingested_count = 0
                     for result in web_results_list:
+                        # This should be via Pub/Sub for background ingestion
                         asyncio.create_task(
                             _background_ingest_knowledge_via_pubsub( # Use Pub/Sub for ingestion
                                 user_id, result.snippet, result.link, result.title
@@ -133,9 +162,17 @@ async def trigger_learning(trigger: LearningTrigger): # Uses Pydantic model for 
                     logger.info(f"Learning Agent: Initiated {ingested_count} ingestion tasks via Pub/Sub for gap '{query}'.")
                 else:
                     logger.warning(f"Learning Agent: Simple research found no new information for gap '{query}'.")
+                    asyncio.create_task( # <--- NEW
+                        log_performance_metric(
+                            agent_name="learning_agent",
+                            metric_name=PerformanceMetricName.KNOWLEDGE_GAP_HANDLED, # <--- NEW
+                            value=0.0, user_id=user_id, # Value 0.0 for "failed" to address meaningfully
+                            context={"query": query, "reason": "no_new_info", "delegated_to_crewai": False}
+                        )
+                    )
 
                 asyncio.create_task( # Log performance via Pub/Sub
-                    _log_gap_handling_performance(
+                    _log_gap_handling_performance( # <--- UPDATED to use new helper
                         user_id, query, True, ingested_count, (crew_result_str is not None), crew_result_str
                     )
                 )
@@ -148,7 +185,7 @@ async def trigger_learning(trigger: LearningTrigger): # Uses Pydantic model for 
             logger.info(f"Learning Agent: Analyzing user feedback: {feedback_details}")
             
             asyncio.create_task( # Log user feedback via Pub/Sub
-                _log_user_feedback_performance(
+                _log_user_feedback_performance( # <--- UPDATED to use new helper
                     trigger.user_id, feedback_details.get("rating"), feedback_details
                 )
             )
@@ -158,12 +195,34 @@ async def trigger_learning(trigger: LearningTrigger): # Uses Pydantic model for 
             raise ZHeroInvalidInputError(message=f"Unknown learning trigger type: {trigger.trigger_type}")
 
     except ZHeroException:
+        end_time = datetime.datetime.now() # <--- NEW
+        total_duration_ms = (end_time - start_time).total_seconds() * 1000 # <--- NEW
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="learning_agent",
+                metric_name=PerformanceMetricName.QUERY_PROCESSED, # Log overall failure
+                value=0.0,
+                user_id=trigger.user_id,
+                context={"trigger_type": trigger.trigger_type, "error": "ZHeroException", "total_duration_ms": total_duration_ms}
+            )
+        )
         raise
     except Exception as e:
+        end_time = datetime.datetime.now() # <--- NEW
+        total_duration_ms = (end_time - start_time).total_seconds() * 1000 # <--- NEW
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="learning_agent",
+                metric_name=PerformanceMetricName.QUERY_PROCESSED, # Log overall failure
+                value=0.0,
+                user_id=trigger.user_id,
+                context={"trigger_type": trigger.trigger_type, "error": str(e), "type": "unexpected", "total_duration_ms": total_duration_ms}
+            )
+        )
         raise ZHeroAgentError("LearningAgent", f"Error processing learning trigger: {e}", original_error=e)
 
 
-# Helper functions for background tasks with error handling
+# Helper functions for background tasks with error handling - MODIFIED to use log_performance_metric
 async def _background_ingest_knowledge_via_pubsub(user_id: str, content: str, source_url: Optional[str], title: Optional[str]):
     if pubsub_publisher:
         try:
@@ -175,59 +234,68 @@ async def _background_ingest_knowledge_via_pubsub(user_id: str, content: str, so
                 ).model_dump(exclude_unset=True)
             )
             logger.info(f"Learning Agent: Background ingestion for '{title}' queued via Pub/Sub.")
+            asyncio.create_task( # <--- NEW
+                log_performance_metric(
+                    agent_name="learning_agent",
+                    metric_name=PerformanceMetricName.KNOWLEDGE_INGESTED,
+                    value=1.0, user_id=user_id,
+                    context={"source": "learning_agent_gap_fill", "title": title}
+                )
+            )
         except ZHeroException as e:
             logger.error(f"Learning Agent: Background ingestion failed (ZHeroException): {title} - {e.message}", exc_info=True)
+            asyncio.create_task( # <--- NEW
+                log_performance_metric(
+                    agent_name="learning_agent",
+                    metric_name=PerformanceMetricName.KNOWLEDGE_INGESTED,
+                    value=0.0, user_id=user_id,
+                    context={"source": "learning_agent_gap_fill", "title": title, "error": e.message}
+                )
+            )
         except Exception as e:
             logger.error(f"Learning Agent: Background ingestion failed (unexpected): {title} - {e}", exc_info=True)
+            asyncio.create_task( # <--- NEW
+                log_performance_metric(
+                    agent_name="learning_agent",
+                    metric_name=PerformanceMetricName.KNOWLEDGE_INGESTED,
+                    value=0.0, user_id=user_id,
+                    context={"source": "learning_agent_gap_fill", "title": title, "error": str(e), "type": "unexpected"}
+                )
+            )
     else:
         logger.warning(f"Learning Agent: Pub/Sub publisher not initialized. Cannot queue background knowledge ingestion.")
 
 async def _log_gap_handling_performance(user_id: str, query: str, success: bool, ingested_count: int, delegated_to_crewai: bool, crew_result_str: Optional[str] = None):
-    if pubsub_publisher:
-        try:
-            await pubsub_publisher.publish_message(
-                "performance_metrics", # Topic defined in config
-                AgentPerformanceMetric(
-                    agent_name="learning_agent",
-                    user_id=user_id,
-                    metric_name="knowledge_gap_handled",
-                    value=1.0 if success else 0.0,
-                    context={
-                        "gap_query": query,
-                        "ingested_count": ingested_count,
-                        "delegated_to_crewai": delegated_to_crewai,
-                        "crew_result_summary": crew_result_str # Include CrewAI summary if applicable
-                    }
-                ).model_dump(exclude_unset=True)
-            )
-            logger.info(f"Learning Agent: Gap handling performance logged via Pub/Sub for {user_id}.")
-        except ZHeroException as e:
-            logger.error(f"Learning Agent: Failed to log gap handling performance (ZHeroException): {e.message}", exc_info=True)
-        except Exception as e:
-            logger.error(f"Learning Agent: Failed to log gap handling performance (unexpected): {e}", exc_info=True)
-    else:
-        logger.warning(f"Learning Agent: Pub/Sub publisher not initialized. Cannot log gap handling performance.")
+    # This helper function is now updated to use log_performance_metric internally
+    status_value = 1.0 if success else 0.0
+    metric_context = {
+        "gap_query": query,
+        "ingested_count": ingested_count,
+        "delegated_to_crewai": delegated_to_crewai,
+        "crew_result_summary": crew_result_str
+    }
+    asyncio.create_task( # <--- UPDATED
+        log_performance_metric(
+            agent_name="learning_agent",
+            metric_name=PerformanceMetricName.KNOWLEDGE_GAP_HANDLED,
+            value=status_value,
+            user_id=user_id,
+            context=metric_context
+        )
+    )
 
 async def _log_user_feedback_performance(user_id: str, rating: Optional[str], details: Dict[str, Any]):
-    if pubsub_publisher:
-        try:
-            await pubsub_publisher.publish_message(
-                "performance_metrics",
-                AgentPerformanceMetric(
-                    agent_name="learning_agent",
-                    user_id=user_id,
-                    metric_name="user_feedback_processed",
-                    value=1.0,
-                    context={"feedback_type": rating, "details": details}
-                ).model_dump(exclude_unset=True)
-            )
-            logger.info(f"Learning Agent: User feedback performance logged via Pub/Sub for {user_id}.")
-        except ZHeroException as e:
-            logger.error(f"Learning Agent: Failed to log user feedback performance (ZHeroException): {e.message}", exc_info=True)
-        except Exception as e:
-            logger.error(f"Learning Agent: Failed to log user feedback performance (unexpected): {e}", exc_info=True)
-    else:
-        logger.warning(f"Learning Agent: Pub/Sub publisher not initialized. Cannot log user feedback performance.")
+    # This helper function is now updated to use log_performance_metric internally
+    metric_context = {"feedback_type": rating, "details": details}
+    asyncio.create_task( # <--- UPDATED
+        log_performance_metric(
+            agent_name="learning_agent",
+            metric_name=PerformanceMetricName.USER_FEEDBACK_PROCESSED,
+            value=1.0, # Assumed success if it reaches here
+            user_id=user_id,
+            context=metric_context
+        )
+    )
 
 
 # --- CrewAI Knowledge Acquisition Functions ---
@@ -239,26 +307,53 @@ async def trigger_crewai_knowledge_acquisition_endpoint(request_data: Dict[str, 
 
     if not user_id or not topic:
         raise ZHeroInvalidInputError(message="User ID and topic are required for CrewAI knowledge acquisition.")
-    
-    # Check pubsub_publisher here too if run_crewai_knowledge_acquisition_crew directly calls it.
-    if pubsub_publisher is None:
-        raise ZHeroDependencyError("LearningAgent", "Pub/Sub", "Pub/Sub publisher not initialized. Cannot run CrewAI tasks that publish.", 500)
-    
+        
+    # pubsub_publisher check is handled by log_performance_metric internally
+    # if pubsub_publisher is None:
+    #    raise ZHeroDependencyError("LearningAgent", "Pub/Sub", "Pub/Sub publisher not initialized. Cannot run CrewAI tasks that publish.", 500)
+        
     if not crew_llm_instance:
         raise ZHeroDependencyError("LearningAgent", "CrewAI LLM", "CrewAI LLM not initialized. Cannot run crew.", 500)
 
-
+    start_time = datetime.datetime.now() # <--- NEW
     try:
         result = await run_crewai_knowledge_acquisition_crew(user_id, topic, context_notes)
+        end_time = datetime.datetime.now() # <--- NEW
+        duration_ms = (end_time - start_time).total_seconds() * 1000 # <--- NEW
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="learning_agent",
+                metric_name=PerformanceMetricName.QUERY_PROCESSED, # <--- NEW
+                value=1.0, user_id=user_id,
+                context={"endpoint": "/trigger_crewai_knowledge_acquisition", "topic": topic, "duration_ms": duration_ms}
+            )
+        )
         return {"message": "CrewAI knowledge acquisition initiated", "result": result}
     except ZHeroException:
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="learning_agent",
+                metric_name=PerformanceMetricName.QUERY_PROCESSED, # <--- NEW
+                value=0.0, user_id=user_id, # Log failure
+                context={"endpoint": "/trigger_crewai_knowledge_acquisition", "topic": topic, "error": "ZHeroException"}
+            )
+        )
         raise
     except Exception as e:
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="learning_agent",
+                metric_name=PerformanceMetricName.QUERY_PROCESSED, # <--- NEW
+                value=0.0, user_id=user_id, # Log failure
+                context={"endpoint": "/trigger_crewai_knowledge_acquisition", "topic": topic, "error": str(e), "type": "unexpected"}
+            )
+        )
         raise ZHeroAgentError("LearningAgent", "Failed to trigger CrewAI knowledge acquisition endpoint.", original_error=e)
 
 
 async def run_crewai_knowledge_acquisition_crew(user_id: str, topic: str, context_notes: str) -> Dict[str, Any]:
     logger.info(f"Learning Agent: Initiating CrewAI Knowledge Acquisition Crew for topic: '{topic}' (User: {user_id})")
+    crew_start_time = datetime.datetime.now() # <--- NEW
 
     if not crew_llm_instance: # Defensive check, should be caught by endpoint
         raise ZHeroDependencyError("LearningAgent", "CrewAI LLM", "CrewAI LLM not initialized. Cannot run knowledge acquisition crew.", 500)
@@ -336,7 +431,25 @@ async def run_crewai_knowledge_acquisition_crew(user_id: str, topic: str, contex
     try:
         crew_result_str = await asyncio.to_thread(knowledge_acquisition_crew.kickoff)
         logger.info(f"Learning Agent: CrewAI Knowledge Acquisition Crew finished. Raw result: {crew_result_str[:200]}...")
+        crew_end_time = datetime.datetime.now() # <--- NEW
+        crew_duration_ms = (crew_end_time - crew_start_time).total_seconds() * 1000 # <--- NEW
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="learning_agent",
+                metric_name=PerformanceMetricName.TOOL_CALL_SUCCESS, # Generic tool/crew success
+                value=1.0, user_id=user_id,
+                context={"tool_name": "crewai_knowledge_acquisition", "topic": topic, "duration_ms": crew_duration_ms}
+            )
+        )
     except Exception as e: # Catch any lower level CrewAI/Langchain exception
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="learning_agent",
+                metric_name=PerformanceMetricName.TOOL_CALL_FAILURE,
+                value=1.0, user_id=user_id,
+                context={"tool_name": "crewai_knowledge_acquisition", "topic": topic, "error": str(e)}
+            )
+        )
         raise ZHeroAgentError("LearningAgent", "CrewAI Knowledge Acquisition Crew kickoff failed.", original_error=e)
 
     ingestion_id_match = re.search(r"KNOWLEDGE_ITEM_ID:\s*\[(.*?)\]", crew_result_str)
@@ -356,24 +469,49 @@ async def periodic_knowledge_review_task():
     Simulates a periodic task where Learning Agent asks Meta-Agent for unaddressed knowledge gaps.
     In production, this would be triggered by Google Cloud Tasks.
     """
+    logger.info("Learning Agent (Periodic): Delaying initial knowledge review for startup.") # <--- NEW
+    await asyncio.sleep(10) # Initial delay for startup
     while True:
         logger.info("Learning Agent (Periodic): Checking for outstanding knowledge gaps...")
+        task_start_time = datetime.datetime.now() # <--- NEW
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="learning_agent",
+                metric_name=PerformanceMetricName.QUERY_PROCESSED, # Log task start using a generic metric
+                value=1.0,
+                context={"task_type": "periodic_knowledge_review", "status": "started"}
+            )
+        )
+
         if not crew_llm_instance:
             logger.warning("Learning Agent (Periodic): CrewAI LLM not initialized. Skipping advanced gap review.")
             await asyncio.sleep(60 * 60)
             continue
-        if pubsub_publisher is None: # Check Pub/Sub for logging
+        # Check for pubsub_publisher no longer needed explicitly as log_performance_metric handles it.
+        # This check is more for publishing the final plan.
+        if pubsub_publisher is None: # Check if Pub/Sub is ready
             logger.warning("Learning Agent (Periodic): Pub/Sub publisher not initialized. Skipping performance logging.")
             await asyncio.sleep(60 * 60)
             continue
 
         try:
+            gap_fetch_start = datetime.datetime.now() # <--- NEW
             gaps_response = await agent_client.post(
                 "meta_agent",
                 "/get_knowledge_gaps",
                 GetKnowledgeGapsRequest(status="unaddressed", limit=5).model_dump(exclude_unset=True) # Pass Pydantic
             )
             gaps: List[KnowledgeGap] = [KnowledgeGap(**g) for g in gaps_response.get("gaps", [])]
+            gap_fetch_end = datetime.datetime.now() # <--- NEW
+            gap_fetch_duration_ms = (gap_fetch_end - gap_fetch_start).total_seconds() * 1000 # <--- NEW
+            asyncio.create_task( # <--- NEW
+                log_performance_metric(
+                    agent_name="learning_agent",
+                    metric_name=PerformanceMetricName.AGENT_API_CALL_SUCCESS, # <--- NEW
+                    value=1.0,
+                    context={"target_agent": "meta_agent", "endpoint": "/get_knowledge_gaps", "count": len(gaps), "duration_ms": gap_fetch_duration_ms}
+                )
+            )
 
             if gaps:
                 logger.info(f"Learning Agent (Periodic): Found {len(gaps)} unaddressed gaps. Evaluating for handling.")
@@ -381,24 +519,48 @@ async def periodic_knowledge_review_task():
                     if "complex" in gap.reason.lower() or "comprehensive" in gap.reason.lower() or "meta_analysis" in gap.reason.lower():
                         logger.info(f"Learning Agent (Periodic): Delegating complex gap '{gap.query_text}' to CrewAI.")
                         crew_run_result = await run_crewai_knowledge_acquisition_crew(gap.user_id, gap.query_text, gap.reason)
-                        await agent_client.post( # Mark gap as in progress via API call
-                            "meta_agent",
-                            "/mark_gap_as_addressed",
-                            MarkGapAsAddressedRequest(gap_id=gap.id, status="in_progress").model_dump(exclude_unset=True)
-                        )
+                        # Log gap handling success/failure
                         asyncio.create_task(
                             _log_gap_handling_performance(
                                 gap.user_id, gap.query_text, True, 0, True, crew_run_result.get("crew_result")
                             )
                         )
+                        # Mark gap as in progress via API call
+                        mark_gap_start = datetime.datetime.now() # <--- NEW
+                        await agent_client.post(
+                            "meta_agent",
+                            "/mark_gap_as_addressed",
+                            MarkGapAsAddressedRequest(gap_id=gap.id, status="in_progress").model_dump(exclude_unset=True)
+                        )
+                        mark_gap_end = datetime.datetime.now() # <--- NEW
+                        mark_gap_duration_ms = (mark_gap_end - mark_gap_start).total_seconds() * 1000 # <--- NEW
+                        asyncio.create_task( # <--- NEW
+                            log_performance_metric(
+                                agent_name="learning_agent",
+                                metric_name=PerformanceMetricName.AGENT_API_CALL_SUCCESS, # <--- NEW
+                                value=1.0, user_id=gap.user_id,
+                                context={"target_agent": "meta_agent", "endpoint": "/mark_gap_as_addressed", "gap_id": gap.id, "new_status": "in_progress", "duration_ms": mark_gap_duration_ms}
+                            )
+                        )
                     else:
                         logger.info(f"Learning Agent (Periodic): Handling simple gap '{gap.query_text}' directly.")
+                        research_start = datetime.datetime.now() # <--- NEW
                         web_results_list_json = await agent_client.post(
                             "research_agent",
                             "/perform_research",
                             SearchRequest(user_id=gap.user_id, query=gap.query_text, num_results=3).model_dump(exclude_unset=True)
                         )
                         web_results_list = [WebSearchResult(**r) for r in web_results_list_json]
+                        research_end = datetime.datetime.now() # <--- NEW
+                        research_duration_ms = (research_end - research_start).total_seconds() * 1000 # <--- NEW
+                        asyncio.create_task( # <--- NEW
+                            log_performance_metric(
+                                agent_name="learning_agent",
+                                metric_name=PerformanceMetricName.AGENT_API_CALL_SUCCESS, # <--- NEW
+                                value=1.0, user_id=gap.user_id,
+                                context={"target_agent": "research_agent", "endpoint": "/perform_research", "duration_ms": research_duration_ms}
+                            )
+                        )
                         ingested_count = 0
                         if web_results_list:
                             for result in web_results_list:
@@ -406,11 +568,24 @@ async def periodic_knowledge_review_task():
                                     _background_ingest_knowledge_via_pubsub(gap.user_id, result.snippet, result.link, result.title)
                                 )
                                 ingested_count += 1
-                        await agent_client.post( # Mark gap as addressed via API call
+                        # Mark gap as addressed via API call
+                        mark_gap_start = datetime.datetime.now() # <--- NEW
+                        await agent_client.post(
                             "meta_agent",
                             "/mark_gap_as_addressed",
                             MarkGapAsAddressedRequest(gap_id=gap.id, status="addressed").model_dump(exclude_unset=True)
                         )
+                        mark_gap_end = datetime.datetime.now() # <--- NEW
+                        mark_gap_duration_ms = (mark_gap_end - mark_gap_start).total_seconds() * 1000 # <--- NEW
+                        asyncio.create_task( # <--- NEW
+                            log_performance_metric(
+                                agent_name="learning_agent",
+                                metric_name=PerformanceMetricName.AGENT_API_CALL_SUCCESS, # <--- NEW
+                                value=1.0, user_id=gap.user_id,
+                                context={"target_agent": "meta_agent", "endpoint": "/mark_gap_as_addressed", "gap_id": gap.id, "new_status": "addressed", "duration_ms": mark_gap_duration_ms}
+                            )
+                        )
+                        # Log gap handling success/failure
                         asyncio.create_task(
                             _log_gap_handling_performance(
                                 gap.user_id, gap.query_text, True, ingested_count, False
@@ -420,9 +595,36 @@ async def periodic_knowledge_review_task():
             else:
                 logger.info(f"Learning Agent (Periodic): No unaddressed knowledge gaps found.")
 
+            task_end_time = datetime.datetime.now() # <--- NEW
+            task_duration_ms = (task_end_time - task_start_time).total_seconds() * 1000 # <--- NEW
+            asyncio.create_task( # <--- NEW
+                log_performance_metric(
+                    agent_name="learning_agent",
+                    metric_name=PerformanceMetricName.QUERY_PROCESSED, # Log task end
+                    value=1.0,
+                    context={"task_type": "periodic_knowledge_review", "status": "completed", "duration_ms": task_duration_ms}
+                )
+            )
+
         except ZHeroException as e:
             logger.error(f"Learning Agent (Periodic): Error during periodic knowledge review (ZHeroException): {e.message}", exc_info=True)
+            asyncio.create_task( # <--- NEW
+                log_performance_metric(
+                    agent_name="learning_agent",
+                    metric_name=PerformanceMetricName.QUERY_PROCESSED, # Log task failure
+                    value=0.0, user_id="system", # user_id could be "system" for periodic tasks
+                    context={"task_type": "periodic_knowledge_review", "status": "failed", "error": e.message}
+                )
+            )
         except Exception as e:
             logger.error(f"Learning Agent (Periodic): Error during periodic knowledge review (unexpected error): {e}", exc_info=True)
+            asyncio.create_task( # <--- NEW
+                log_performance_metric(
+                    agent_name="learning_agent",
+                    metric_name=PerformanceMetricName.QUERY_PROCESSED, # Log task failure
+                    value=0.0, user_id="system",
+                    context={"task_type": "periodic_knowledge_review", "status": "failed", "error": str(e), "type": "unexpected"}
+                )
+            )
 
         await asyncio.sleep(60 * 60)

@@ -17,10 +17,14 @@ from zhero_common.exceptions import ( # Import all necessary ZHeroExceptions
     ZHeroException, ZHeroAgentError, ZHeroInvalidInputError, ZHeroDependencyError, ZHeroVertexAIError
 )
 from zhero_common.pubsub_client import initialize_pubsub_publisher # Import Pub/Sub initializer
+from zhero_common.metrics import log_performance_metric, PerformanceMetricName # <--- NEW
 
 # Import the actual FastAPI app instance from the orchestration_agent.py file
 try:
-    from agents.orchestration_agent import app as orchestration_agent_app
+    # Use direct import for local development if zhero_adk_backend is the root
+    # from agents.orchestration_agent import app as orchestration_agent_app
+    # If not at project root/properly installed:
+    from zhero_adk_backend.agents.orchestration_agent import app as orchestration_agent_app # <--- ADJUSTED FOR YOUR STRUCTURE
     logger.info("Successfully imported orchestration_agent.py as the main application for the Orchestration Agent.")
 except ImportError as e:
     logger.error(f"Failed to import orchestration_agent.py: {e}", exc_info=True)
@@ -44,15 +48,31 @@ async def zhero_exception_handler(request: Request, exc: ZHeroException):
         }
     )
 
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    logger.error(f"HTTPException caught for request {request.url.path}: {exc.detail}", exc_info=True, extra={"status_code": exc.status_code, "request_body": await request.body()})
+@app.exception_handler(httpx.HTTPStatusError) # <--- NEW - Catch httpx errors from simulate_user_request
+async def httpx_status_exception_handler(request: Request, exc: httpx.HTTPStatusError):
+    # This handler is specific to errors coming from the `simulate_user_request` in main.py
+    # It catches 4xx/5xx responses from downstream agents wrapped in httpx.HTTPStatusError.
+    logger.error(f"HTTPStatusError from simulated request to {request.url.path}: {exc.response.status_code} - {exc.response.text}", exc_info=True)
+    # Attempt to parse details if the response is JSON, specifically from ZHeroException
+    try:
+        error_details = exc.response.json()
+        if "error_type" in error_details:
+            return JSONResponse(
+                status_code=exc.response.status_code,
+                content={
+                    "error_type": error_details.get("error_type", "HTTPError"),
+                    "message": error_details.get("message", "An HTTP error occurred"),
+                    "details": error_details.get("details", exc.response.text)
+                }
+            )
+    except json.JSONDecodeError:
+        pass # Not a JSON response, proceed with generic error
     return JSONResponse(
-        status_code=exc.status_code,
+        status_code=exc.response.status_code,
         content={
-            "error_type": "HTTPException",
-            "message": exc.detail,
-            "details": getattr(exc, 'body', None) # For ValidationError details
+            "error_type": "HTTPError",
+            "message": f"Service responded with an HTTP error: {exc.response.status_code}",
+            "details": exc.response.text
         }
     )
 
@@ -99,37 +119,76 @@ async def simulate_user_request(user_id: str, query_text: str, image_url: Option
         user_id=user_id,
         query_text=query_text,
         conversation_history=[], # Keeping it simple for demo, can be expanded
-        user_profile_data={"interests": "AI, Quantum Physics", "style": "technical"},
+        user_profile_data={"interests": "AI, Quantum Physics", "style": "technical"}, # <--- UPDATED
         image_url=image_url # Pass image_url if provided
     )
 
     try:
+        start_time = datetime.datetime.now() # <--- NEW
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(client_endpoint, json=user_query_payload.model_dump(exclude_unset=True))
             response.raise_for_status() # Raise an exception for 4xx or 5xx status codes
             ai_response = AIResponse(**response.json())
             logger.info(f"Received AI Response for user {user_id}: {ai_response.response_text[:100]}...")
+
+            end_time = datetime.datetime.now() # <--- NEW
+            duration_ms = (end_time - start_time).total_seconds() * 1000 # <--- NEW
+            asyncio.create_task( # <--- NEW
+                log_performance_metric(
+                    agent_name="main_simulation", # <--- NEW
+                    metric_name=PerformanceMetricName.QUERY_PROCESSED, # <--- NEW
+                    value=1.0, # <--- NEW
+                    user_id=user_id, # <--- NEW
+                    context={"query_text": query_text, "response_length": len(ai_response.response_text), "duration_ms": duration_ms} # <--- NEW
+                )
+            )
+            asyncio.create_task( # <--- NEW
+                log_performance_metric(
+                    agent_name="main_simulation", # <--- NEW
+                    metric_name=PerformanceMetricName.API_CALL_LATENCY_MS, # <--- NEW
+                    value=duration_ms, # <--- NEW
+                    user_id=user_id, # <--- NEW
+                    context={"endpoint": "/orchestrate_query", "status_code": response.status_code} # <--- NEW
+                )
+            )
+
             return ai_response
     except httpx.HTTPStatusError as e:
         logger.error(f"HTTP Error from Orchestration Agent: {e.response.status_code} - {e.response.text}", exc_info=True)
-        # Attempt to parse as ZHeroException from response body if possible
-        try:
-            error_details = e.response.json()
-            if "error_type" in error_details:
-                raise ZHeroException(
-                    message=f"Orchestration Agent responded with: {error_details.get('message', 'Unknown error')}",
-                    status_code=e.response.status_code,
-                    details=error_details
-                )
-            else:
-                raise # Re-raise standard HTTPException if not a ZHeroException
-        except json.JSONDecodeError:
-            raise # Re-raise if response is not JSON
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="main_simulation", # <--- NEW
+                metric_name=PerformanceMetricName.AGENT_API_CALL_FAILURE, # <--- NEW
+                value=1.0, # <--- NEW
+                user_id=user_id, # <--- NEW
+                context={"endpoint": "/orchestrate_query", "status_code": e.response.status_code, "error": e.response.text} # <--- NEW
+            )
+        )
+        # Re-raise to be caught by HTTPException handler (or specific ZHeroException handler if applicable)
+        raise
     except httpx.RequestError as e:
         logger.error(f"Network Error connecting to Orchestration Agent: {e}", exc_info=True)
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="main_simulation", # <--- NEW
+                metric_name=PerformanceMetricName.AGENT_API_CALL_FAILURE, # <--- NEW
+                value=1.0, # <--- NEW
+                user_id=user_id, # <--- NEW
+                context={"endpoint": "/orchestrate_query", "error": str(e), "type": "network_error"} # <--- NEW
+            )
+        )
         raise
     except Exception as e:
         logger.error(f"An unexpected error occurred during simulation: {e}", exc_info=True)
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="main_simulation", # <--- NEW
+                metric_name=PerformanceMetricName.AGENT_API_CALL_FAILURE, # <--- NEW
+                value=1.0, # <--- NEW
+                user_id=user_id, # <--- NEW
+                context={"endpoint": "/orchestrate_query", "error": str(e), "type": "unexpected_error"} # <--- NEW
+            )
+        )
         raise
 
 async def run_simulation():
