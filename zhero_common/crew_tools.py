@@ -1,4 +1,4 @@
-# zhero_common/crew_tools.py (As provided in previous step, ensuring consistency)
+# zhero_common/crew_tools.py
 
 from crewai_tools import Tool
 from typing import Dict, Any, List, Optional
@@ -12,6 +12,7 @@ from zhero_common.config import logger # Import logger
 
 # Define CrewAI-compatible tools that wrap your existing Z-HERO API calls
 
+# 1. Semantic Knowledge Search Tool
 SemanticKnowledgeSearchTool = Tool(
     name="SemanticKnowledgeSearch",
     description="Searches the user's personalized internal knowledge base (Mind Palace) for semantically relevant information. Prioritize this for known topics or user-specific information. Arguments: query_text (str), user_id (str), top_k (int).",
@@ -22,6 +23,7 @@ SemanticKnowledgeSearchTool = Tool(
     )
 )
 
+# 2. Web Search Tool
 WebSearchTool = Tool(
     name="WebSearch",
     description="Performs a general web search to find external, public, or very up-to-date information. Arguments: query (str), user_id (str), num_results (int).",
@@ -32,6 +34,7 @@ WebSearchTool = Tool(
     )
 )
 
+# 3. Ingest Knowledge Item Tool
 IngestKnowledgeItemTool = Tool(
     name="IngestKnowledgeItem",
     description="Stores new or updated information into the user's personalized internal knowledge base. Provide user_id, content, and optionally source_url, title, rack, book.",
@@ -42,6 +45,7 @@ IngestKnowledgeItemTool = Tool(
     )
 )
 
+# 4. Summarization Tool
 SummarizationTool = Tool(
     name="Summarization",
     description="Condenses long blocks of text into concise summaries. Arguments: text_content (str).",
@@ -52,16 +56,18 @@ SummarizationTool = Tool(
     )
 )
 
+# 5. Log Internal Knowledge Gap Tool (for Meta-Agent)
 LogInternalKnowledgeGapTool = Tool(
     name="LogInternalKnowledgeGap",
     description="Informs the Meta-Agent about instances where Z-HERO could not find relevant information or confidently answer a query. Arguments: user_id (str), query_text (str), reason (str).",
-    func=lambda user_id, query_text, reason: agent_client.post(
+    func=lambda user_id, query_text, reason: agent_client.post( # This should probably publish to Pub/Sub
         "meta_agent",
         "/log_knowledge_gap_event",
-        {"user_id": user_id, "query_text": query_text, "reason": reason, "trigger_type": "knowledge_gap_event"}
+        {"user_id": user_id, "query_text": query_text, "reason": reason, "trigger_type": "knowledge_gap_event"} # Simplified payload for now
     )
 )
 
+# 6. Update User Preference Tool
 UpdateUserPreferenceTool = Tool(
     name="UpdateUserPreference",
     description="Records or updates a specific user preference (e.g., learning style, favorite topics). Arguments: user_id (str), preference_key (str), preference_value (Any).",
@@ -72,6 +78,7 @@ UpdateUserPreferenceTool = Tool(
     )
 )
 
+# 7. Process Multimodal Content Tool
 ProcessMultimodalContentTool = Tool(
     name="ProcessMultimodalContent",
     description="Forwards multimodal queries (text + image) to a specialized agent for deeper analysis and interpretation. Arguments: user_id (str), query_text (str), image_url (str).",
@@ -83,23 +90,14 @@ ProcessMultimodalContentTool = Tool(
 )
 
 # NEW TOOL: ReadSystemLogsTool for Meta-Agent's Crew
-# This tool directly queries Supabase (mock client for demo) to get system logs.
-# In a real environment, you'd ensure proper authentication/authorization for this access.
 class ReadSystemLogsTool(Tool):
     def __init__(self):
         super().__init__(
             name="ReadSystemLogs",
             description="Accesses Z-HERO's internal system logs and knowledge gap records from the Meta-Agent's data store (Supabase). This tool provides raw data for analysis. Arguments: log_type (str, e.g., 'performance_logs', 'knowledge_gaps'), limit (int, max 100), status (str, for knowledge_gaps, e.g., 'unaddressed').",
-            func=self._read_logs # func should refer to an async method
+            func=self._read_logs
         )
 
-    # CrewAI tools require sync functions. To use an async method, we need a wrapper.
-    # CrewAI allows specifying a sync func and running async code inside.
-    # However, direct async method as func= is better.
-    # For simplicity in Tool definition, we pass a callable that manages the async nature.
-    # CrewAI's `Tool` can accept an async function directly if it's new enough (>= v0.2.0 for `crewai-tools`).
-    # If not, you'd wrap it like this: `async def _read_logs_sync_wrapper(self, *args, **kwargs): return await self._read_logs(*args, **kwargs); return asyncio.run(self._read_logs_sync_wrapper(*args, **kwargs))`
-    # For now, assuming CrewAI can handle awaitable objects for the `func` parameter.
     async def _read_logs(self, log_type: str, limit: int = 10, status: Optional[str] = None) -> List[Dict]:
         """
         Reads system logs or knowledge gaps from Supabase.
@@ -128,16 +126,15 @@ class ReadSystemLogsTool(Tool):
                         cleaned_item[key] = value.isoformat()
                 cleaned_data.append(cleaned_item)
 
-            return cleaned_data # Return raw list of dicts for LLM to parse
+            return cleaned_data
         except Exception as e:
             logger.error(f"ReadSystemLogsTool: Error reading logs of type {log_type}: {e}", exc_info=True)
             return {"error": f"Failed to read logs: {str(e)}"}
 
-# Instantiate the tool once
-read_system_logs_tool_instance = ReadSystemLogsTool() # Global instance
+read_system_logs_tool_instance = ReadSystemLogsTool()
 
 ALL_ZHERO_CREW_TOOLS = [
     SemanticKnowledgeSearchTool, WebSearchTool, IngestKnowledgeItemTool,
     SummarizationTool, LogInternalKnowledgeGapTool, UpdateUserPreferenceTool,
-    ProcessMultimodalContentTool, read_system_logs_tool_instance # Use the instantiated object
+    ProcessMultimodalContentTool, read_system_logs_tool_instance
 ]

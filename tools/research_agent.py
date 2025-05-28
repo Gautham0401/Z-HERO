@@ -1,67 +1,90 @@
-# research_agent.py
-from fastapi import FastAPI, HTTPException
-import httpx # For network requests to external tools
-from google.api_client import discovery # For Google Custom Search client
+# tools/research_agent.py
+from fastapi import FastAPI, Request, status
+from fastapi.responses import JSONResponse
+import googleapiclient.discovery
+from typing import List, Optional
+import datetime
 
 # Import common utilities
-from zhero_common.config import logger, os, TOOL_ENDPOINTS
-from zhero_common.models import SearchRequest, WebSearchResult
-from zhero_common.clients import tool_client # Use the imported tool client
+from zhero_common.config import logger, os
+from zhero_common.models import SearchRequest, WebSearchResult # SearchRequest is already Pydantic
+from zhero_common.exceptions import (
+    ZHeroException, ZHeroAgentError, ZHeroInvalidInputError,
+    ZHeroDependencyError
+)
+# NEW: Pub/Sub Publisher instance
+from zhero_common.pubsub_client import pubsub_publisher, initialize_pubsub_publisher
+
 
 app = FastAPI(title="Research Agent")
 
-# Initialize Google Custom Search client (if used directly, otherwise Orchestration handles)
-# In most cases, the Web Search Tool will encapsulate this, and Research Agent just calls the tool.
-# This client is here for illustration if Research Agent bypassed the dedicated tool.
-cse_service = None
-try:
-    cse_service = discovery.build(
-        "customsearch", "v1", developerKey=os.environ["GOOGLE_CSE_API_KEY"]
-    )
-    logger.info("Research Agent: Initialized Google Custom Search service.")
-except Exception as e:
-    logger.warning(f"Research Agent: Failed to initialize Google Custom Search service directly: {e}. Will rely on dedicated tool.", exc_info=True)
+# --- Global Exception Handlers (REQUIRED IN ALL AGENT FILES) ---
+@app.exception_handler(ZHeroException)
+async def zhero_exception_handler(request: Request, exc: ZHeroException):
+    logger.error(f"ZHeroException caught for request {request.url.path}: {exc.message}", exc_info=True, extra={"details": exc.details, "status_code": exc.status_code})
+    return JSONResponse(status_code=exc.status_code, content={"error_type": exc.__class__.__name__,"message": exc.message,"details": exc.details})
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    logger.error(f"HTTPException caught for request {request.url.path}: {exc.detail}", exc_info=True, extra={"status_code": exc.status_code, "request_body": await request.body()})
+    return JSONResponse(status_code=exc.status_code, content={"error_type": "HTTPException","message": exc.detail,"details": getattr(exc, 'body', None)})
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    log_id = f"ERR-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}" # Simple unique ID for error
+    logger.critical(f"Unhandled Exception caught for request {request.url.path} (ID: {log_id}): {exc}", exc_info=True)
+    return JSONResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content={"error_type": "InternalServerError","message": "An unexpected internal server error occurred. Please try again later.","error_id": log_id, "details": str(exc) if app.debug else None})
+# --- END Global Exception Handlers ---
+
+
+cse_service: Optional[googleapiclient.discovery.Resource] = None
+@app.on_event("startup")
+async def startup_event():
+    global cse_service
+    # Initialize Pub/Sub Publisher
+    await initialize_pubsub_publisher()
+    try:
+        cse_service = googleapiclient.discovery.build(
+            "customsearch", "v1", developerKey=os.environ["GOOGLE_CSE_API_KEY"]
+        )
+        logger.info("Research Agent: Initialized Google Custom Search service.")
+    except Exception as e:
+        logger.error(f"Research Agent: Failed to initialize Google Custom Search service: {e}", exc_info=True)
+        raise ZHeroDependencyError("ResearchAgent", "Google Custom Search", "Failed to initialize Google Custom Search service on startup.", original_error=e)
 
 
 @app.post("/perform_research", response_model=List[WebSearchResult], summary="Performs web research using the Web Search Tool")
-async def perform_research(request: SearchRequest):
+async def perform_research(request: SearchRequest): # SearchRequest is already Pydantic
     """
     Performs comprehensive web research by calling the dedicated Web Search Tool.
     This agent can also include logic for advanced parsing, filtering, and source assessment.
     """
+    if not cse_service: # Although initialized at startup, defensive check
+        raise ZHeroDependencyError("ResearchAgent", "Google Custom Search", "Google Custom Search service not initialized.", 500)
+    
     logger.info(f"Research Agent: Received research request for '{request.query}' (User: {request.user_id})")
     try:
-        # Call the dedicated Web Search Tool
+        # Call the dedicated Web Search Tool (will use agent_client's retry/circuit breaker)
         web_results_json = await tool_client.post(
             "web_search_tool",
             "/search",
-            request.model_dump(exclude_unset=True) # Pass search request data
+            request.model_dump(exclude_unset=True)
         )
         web_results = [WebSearchResult(**r) for r in web_results_json]
         logger.info(f"Research Agent: Web Search Tool returned {len(web_results)} results.")
 
-        # (Conceptual) Add logic for source assessment, filtering, and content extraction here
-        # For a truly robust Research Agent, you'd implement:
-        # - More advanced web scraping (e.g., with Playwright/Selenium for dynamic content)
-        # - Content cleaning (remove ads, navigations)
-        # - Source reliability scoring (e.g., based on domain, publication history)
-        # - Identifying key entities from search results
         for result in web_results:
-            # Mock source reliability scoring
             if "wikipedia.org" in result.link:
                 result.source_reliability_score = 0.9
             elif "blog" in result.link and "personal" in result.link:
                 result.source_reliability_score = 0.3
             else:
-                result.source_reliability_score = 0.7 # Default
+                result.source_reliability_score = 0.7
 
-            # (Conceptual) Extract publication date from URL or content
-            result.publication_date = "2024-05-24" # Mock current date
+            result.publication_date = datetime.datetime.now().isoformat()
 
         logger.info(f"Research Agent: Processed {len(web_results)} web research results.")
         return web_results
+    except ZHeroException: raise
     except Exception as e:
-        logger.error(f"Research Agent: Error performing research: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Research failed: {e}")
-
-# To run this agent: uvicorn research_agent:app --port 8003 --reload
+        raise ZHeroAgentError("ResearchAgent", f"Error performing research for '{request.query}'.", original_error=e)

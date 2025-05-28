@@ -1,6 +1,6 @@
-# zhero_common/models.py (UPDATED)
-from pydantic import BaseModel, Field
-from typing import List, Dict, Optional, Any
+# zhero_common/models.py
+from pydantic import BaseModel, Field, EmailStr, AnyUrl
+from typing import List, Dict, Optional, Any, Literal
 import datetime
 
 # --- General Communication Models ---
@@ -8,7 +8,7 @@ class AgentMessage(BaseModel):
     sender: str
     content: str
     metadata: Dict[str, Any] = Field(default_factory=dict)
-    tool_calls: Optional[List[Dict[str, Any]]] = None # For agents requesting tool usage
+    tool_calls: Optional[List[Dict[str, Any]]] = None
 
 class ToolCall(BaseModel):
     tool_name: str
@@ -20,121 +20,139 @@ class ToolResponse(BaseModel):
     success: bool
     error: Optional[str] = None
 
-class UserQuery(BaseModel):
-    user_id: str
-    query_text: str
-    conversation_history: List[Dict[str, str]] = Field(default_factory=list)
-    # user_profile_data and sentiment would typically be fetched by Orchestration Agent
-    # For simplicity, if pre-computed for demo, can be passed.
-    user_profile_data: Optional[Dict[str, Any]] = None
-    sentiment: Optional[str] = None # e.g., 'positive', 'neutral', 'negative'
-    image_url: Optional[str] = None # <--- ADDED THIS FIELD HERE
+class BaseRequest(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=100, description="Unique identifier for the user.")
+
+class UserQuery(BaseRequest):
+    query_text: str = Field(..., min_length=1, description="The user's input query text.")
+    conversation_history: List[Dict[str, str]] = Field(default_factory=list, description="Previous turns in the conversation.")
+    user_profile_data: Optional[Dict[str, Any]] = Field(None, description="Pre-fetched user profile data.")
+    sentiment: Optional[str] = Field(None, description="Inferred sentiment of the user's query.")
+    image_url: Optional[AnyUrl] = Field(None, description="URL of an image associated with the query, if any.")
 
 class AIResponse(BaseModel):
     user_id: str
     response_text: str
-    source_citations: List[Dict[str, str]] = Field(default_factory=list) # e.g., {"url": "...", "title": "..."}
-    internal_notes: Optional[Dict[str, Any]] = None # For debugging/logging
+    source_citations: List[Dict[str, str]] = Field(default_factory=list)
+    internal_notes: Optional[Dict[str, Any]] = None
 
 # --- Agent-Specific Models ---
 
 # User Profile Agent
 class UserProfile(BaseModel):
-    user_id: str
-    email: Optional[str] = None
-    explicit_preferences: Dict[str, Any] = Field(default_factory=dict) # e.g., {"favorite_topics": ["AI", "space"], "learning_style": "visual"}
+    user_id: str = Field(..., min_length=1, max_length=100)
+    email: Optional[EmailStr] = None
+    explicit_preferences: Dict[str, Any] = Field(default_factory=dict)
     inferred_interests: List[str] = Field(default_factory=list)
     last_active: datetime.datetime = Field(default_factory=datetime.datetime.utcnow)
-    # Add fields for racks/books metadata linking
-    initialized_racks: bool = False # Flag for initial setup
+    initialized_racks: bool = False
+
+class UserProfileUpdateRequest(BaseRequest):
+    updates: Dict[str, Any] = Field(..., min_items=1)
+
+class UserPreferenceUpdateRequest(BaseRequest):
+    user_id: str = Field(..., min_length=1)
+    preference_key: str = Field(..., min_length=1)
+    preference_value: Any
 
 # Knowledge Management Agent
 class KnowledgeItem(BaseModel):
-    id: Optional[str] = None # Unique ID for the knowledge chunk
-    user_id: str # Or 'system' for general knowledge
-    content: str # The actual text content
-    source_url: Optional[str] = None
-    title: Optional[str] = None
-    rack: Optional[str] = None # Z-HERO specific metadata (e.g., "Technology")
-    book: Optional[str] = None # Z-HERO specific metadata (e.g., "Quantum Computing Basics")
-    embeddings: Optional[List[float]] = None # Stored after generation
-    timestamp: datetime.datetime = Field(default_factory=datetime.datetime.utcnow)
-    score: Optional[float] = None # For retrieval scores
+    id: Optional[str] = None
+    user_id: str = Field(..., min_length=1)
+    content: str = Field(..., min_length=1)
+    source_url: Optional[AnyUrl] = None
+    title: Optional[str] = Field(None, min_length=1, max_length=255)
+    rack: Optional[str] = Field(None, min_length=1, max_length=100)
+    book: Optional[str] = Field(None, min_length=1, max_length=100)
+    embeddings: Optional[List[float]] = None
+    timestamp: datetime.datetime = Field(default_factory=datetime.utcnow)
+    score: Optional[float] = None
 
-class KnowledgeSearchQuery(BaseModel):
-    user_id: str
-    query_text: str
-    top_k: int = 5
+class KnowledgeSearchQuery(BaseRequest):
+    query_text: str = Field(..., min_length=1)
+    top_k: int = Field(5, gt=0, le=100)
     filter_by_racks: Optional[List[str]] = None
     filter_by_books: Optional[List[str]] = None
 
 class SearchResult(BaseModel):
     knowledge_item: KnowledgeItem
-    score: float # Relevance score
+    score: float
 
 # Research Agent / Web Search Tool
-class SearchRequest(BaseModel):
-    query: str
-    user_id: str
-    num_results: int = 3
-    language: str = "en"
+class SearchRequest(BaseRequest):
+    query: str = Field(..., min_length=1)
+    num_results: int = Field(3, gt=0, le=10)
+    language: str = Field("en", min_length=2, max_length=5)
 
 class WebSearchResult(BaseModel):
-    title: str
-    link: str
-    snippet: str
+    title: str = Field(..., min_length=1)
+    link: AnyUrl = Field(...)
+    snippet: str = Field(..., min_length=1)
     publication_date: Optional[str] = None
-    source_reliability_score: Optional[float] = None # From Research Agent assessment
+    source_reliability_score: Optional[float] = None
 
 # Voice Interface Agent
-class SpeechToTextRequest(BaseModel):
-    audio_content_base64: str # Base64 encoded audio bytes
-    encoding: str # e.g., "LINEAR16", "FLAC"
-    sample_rate_hertz: int
-    language_code: str = "en-US"
-    user_id: str
+class SpeechToTextRequest(BaseRequest):
+    audio_content_base64: str = Field(..., min_length=1)
+    encoding: str = Field(..., min_length=1)
+    sample_rate_hertz: int = Field(..., gt=0)
+    language_code: str = Field("en-US", min_length=2, max_length=10)
 
 class SpeechToTextResponse(BaseModel):
     transcription: str
     confidence: float
 
-class TextToSpeechRequest(BaseModel):
-    text: str
-    user_id: str
-    voice_name: Optional[str] = "en-US-Standard-A"
-    speaking_rate: float = 1.0
-    pitch: float = 0.0
+class TextToSpeechRequest(BaseRequest):
+    text: str = Field(..., min_length=1)
+    voice_name: Optional[str] = Field("en-US-Standard-A", min_length=1)
+    speaking_rate: float = Field(1.0, gt=0.0, le=4.0)
+    pitch: float = Field(0.0, ge=-20.0, le=20.0)
 
 class TextToSpeechResponse(BaseModel):
-    audio_content_base64: str # Base64 encoded audio bytes
+    audio_content_base64: str
 
 # Sentiment Analysis Agent
-class AnalyzeSentimentRequest(BaseModel):
-    text: str
-    user_id: str
+class AnalyzeSentimentRequest(BaseRequest):
+    text: str = Field(..., min_length=1)
 
 class SentimentResponse(BaseModel):
-    sentiment: str # e.g., "positive", "neutral", "negative", "mixed"
-    score: float # From -1.0 (negative) to 1.0 (positive)
-    magnitude: float # Strength of emotion (0 to infinity)
+    sentiment: Literal["positive", "neutral", "negative", "mixed"]
+    score: float = Field(..., ge=-1.0, le=1.0)
+    magnitude: float = Field(..., ge=0.0)
 
 # Learning Agent
-class LearningTrigger(BaseModel):
-    user_id: str
-    trigger_type: str # e.g., "knowledge_gap", "low_confidence_response", "user_feedback"
-    details: Dict[str, Any]
+class LearningTrigger(BaseRequest):
+    trigger_type: str = Field(..., min_length=1)
+    details: Dict[str, Any] = Field(default_factory=dict)
 
-class KnowledgeGap(BaseModel):
-    query_text: str
-    user_id: str
-    reason: str # e.g., "no_relevant_book_found", "outdated_info", "low_confidence"
-    timestamp: datetime.datetime = Field(default_factory=datetime.datetime.utcnow)
+# Sub-model for knowledge gap details within LearningTrigger
+class KnowledgeGapDetails(BaseModel):
+    query_text: str = Field(..., min_length=1)
+    reason: str = Field(..., min_length=1)
+
+class KnowledgeGap(BaseRequest):
+    query_text: str = Field(..., min_length=1)
+    reason: str = Field(..., min_length=1)
+    status: Literal["unaddressed", "in_progress", "addressed", "rejected"] = "unaddressed"
+    timestamp: datetime.datetime = Field(default_factory=datetime.utcnow)
 
 # Meta-Agent
-class AgentPerformanceMetric(BaseModel):
-    agent_name: str
-    timestamp: datetime.datetime = Field(default_factory=datetime.datetime.utcnow)
-    user_id: Optional[str] = None
-    metric_name: str # e.g., "latency_ms", "success_rate", "tokens_consumed"
+class AgentPerformanceMetric(BaseRequest):
+    agent_name: str = Field(..., min_length=1)
+    metric_name: str = Field(..., min_length=1)
     value: float
     context: Dict[str, Any] = Field(default_factory=dict)
+    timestamp: datetime.datetime = Field(default_factory=datetime.utcnow)
+
+class GetKnowledgeGapsRequest(BaseModel):
+    status: Optional[Literal["unaddressed", "in_progress", "addressed", "rejected"]] = "unaddressed"
+    limit: int = Field(10, gt=0, le=100)
+
+class MarkGapAsAddressedRequest(BaseModel):
+    gap_id: str = Field(..., min_length=1)
+    status: Literal["addressed", "in_progress", "rejected"] = "addressed"
+
+# Multimodal Agent.process_content
+class MultimodalProcessRequest(BaseRequest):
+    query_text: str = Field(..., min_length=1)
+    image_url: AnyUrl = Field(...)

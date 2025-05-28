@@ -1,8 +1,22 @@
 # zhero_common/clients.py
-import httpx # For making HTTP requests between microservices
+import httpx
 from zhero_common.config import AGENT_ENDPOINTS, TOOL_ENDPOINTS, logger
 from fastapi import HTTPException
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+from tenacity import (
+    retry, wait_exponential, stop_after_attempt, retry_if_exception_type,
+    CircuitBreakerError, before_sleep_log
+)
+import logging
+import datetime # For MockSupabaseClient timestamp
+import os # For MockSupabaseClient init
+
+from zhero_common.exceptions import (
+    ZHeroException, ZHeroDependencyError, ZHeroAgentError
+)
+
+tenacity_logger = logging.getLogger('tenacity')
+tenacity_logger.setLevel(logging.INFO)
 
 class AgentClient:
     """
@@ -10,52 +24,99 @@ class AgentClient:
     """
     def __init__(self, endpoint_map: Dict[str, str]):
         self.endpoint_map = endpoint_map
+        self._circuit_breakers: Dict[str, bool] = {}
+
+    def _is_5xx_error(response: httpx.Response) -> bool:
+        return 500 <= response.status_code < 600
+
+    @retry(
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        stop=stop_after_attempt(3),
+        retry=(
+            retry_if_exception_type(httpx.RequestError) |
+            retry_if_exception_type(httpx.HTTPStatusError)
+        ),
+        before_sleep=before_sleep_log(tenacity_logger, logging.INFO),
+        reraise=True
+    )
+    async def _post_with_retry_logic(self, service_name: str, full_url: str, json_data: Dict[str, Any]):
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(full_url, json=json_data)
+                if 400 <= response.status_code < 500:
+                    tenacity_logger.error(f"AgentClient: Non-retryable 4xx error from {service_name} ({full_url}): {response.status_code} - {response.text}")
+                    raise httpx.HTTPStatusError(
+                        f"Non-retryable client error: {response.text}",
+                        request=response.request,
+                        response=response
+                    )
+                response.raise_for_status()
+                return response.json()
+        except httpx.HTTPStatusError as e:
+            tenacity_logger.error(f"AgentClient: HTTPStatusError from {service_name} ({full_url}): {e.response.status_code} - {e.response.text}", exc_info=True)
+            raise ZHeroDependencyError(
+                agent_name="AgentClient",
+                dependency=service_name,
+                message=f"HTTP Error {e.response.status_code}",
+                status_code=e.response.status_code,
+                original_error=e.response.text
+            )
+        except httpx.RequestError as e:
+            tenacity_logger.error(f"AgentClient: RequestError (network/timeout) from {service_name} ({full_url}): {e}", exc_info=True)
+            raise ZHeroDependencyError(
+                agent_name="AgentClient",
+                dependency=service_name,
+                message=f"Network/Connection error: {e}",
+                status_code=503,
+                original_error=str(e)
+            )
 
     async def post(self, service_name: str, path: str, json_data: Dict[str, Any]):
-        """
-        Sends a POST request to a specific agent's or tool's endpoint.
-        """
         base_url = self.endpoint_map.get(service_name)
         if not base_url:
             logger.error(f"AgentClient: Unknown service name: {service_name}")
-            raise HTTPException(status_code=500, detail=f"Internal error: Unknown service '{service_name}'")
+            raise ZHeroAgentError("AgentClient", f"Unknown service '{service_name}' in endpoint map.", 500)
 
         full_url = f"{base_url}{path}"
-        try:
-            logger.info(f"AgentClient: Calling {service_name} at {full_url}")
-            async with httpx.AsyncClient(timeout=30.0) as client: # Increased timeout for potential LLM calls
-                response = await client.post(full_url, json=json_data)
-                response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-                logger.info(f"AgentClient: Received success response from {service_name}")
-                return response.json()
-        except httpx.HTTPStatusError as e:
-            logger.error(f"AgentClient: HTTP error calling {service_name} ({full_url}): {e.response.status_code} - {e.response.text}", exc_info=True)
-            raise HTTPException(status_code=e.response.status_code, detail=f"Error from {service_name}: {e.response.text}")
-        except httpx.RequestError as e:
-            logger.error(f"AgentClient: Network error calling {service_name} ({full_url}): {e}", exc_info=True)
-            raise HTTPException(status_code=503, detail=f"Network error calling {service_name}: {e}")
-        except Exception as e:
-            logger.error(f"AgentClient: Unexpected error calling {service_name} ({full_url}): {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=f"Unexpected error calling {service_name}: {e}")
 
-# Global clients for inter-agent communication
+        if self._circuit_breakers.get(service_name):
+            logger.warning(f"AgentClient: Circuit breaker is OPEN for {service_name}. Failing fast.")
+            raise ZHeroDependencyError(
+                agent_name="AgentClient",
+                dependency=service_name,
+                message=f"Circuit breaker is open for {service_name}. Try again later.",
+                status_code=503
+            )
+
+        try:
+            result = await self._post_with_retry_logic(service_name, full_url, json_data)
+            if self._circuit_breakers.get(service_name):
+                logger.info(f"AgentClient: Circuit breaker for {service_name} closed due to success.")
+                self._circuit_breakers[service_name] = False
+            return result
+        except ZHeroDependencyError as e:
+            if e.status_code >= 500:
+                self._circuit_breakers[service_name] = True
+                logger.error(f"AgentClient: Circuit breaker OPENED for {service_name} due to repeated failures.")
+            raise
+        except Exception as e:
+            logger.error(f"AgentClient: Unexpected non-ZHero exception calling {service_name} ({full_url}): {e}", exc_info=True)
+            raise ZHeroException(f"An unexpected error occurred during call to {service_name}", 500, str(e))
+
 agent_client = AgentClient(AGENT_ENDPOINTS)
 tool_client = AgentClient(TOOL_ENDPOINTS)
 
-# --- Supabase Mock (for demonstration where true Supabase client is not initialized) ---
-# In a real environment, you'd use the official Supabase Python client (supabase-py).
-# This mock prevents errors in demonstration code where we don't set up the full client.
 class MockSupabaseClient:
     def __init__(self, url, key):
+        logger.info(f"Initialized MockSupabaseClient: {url}")
         self.url = url
         self.key = key
-        self.data_store = {} # Simulating database tables in memory (resets on restart)
-        logger.info(f"Initialized MockSupabaseClient for {url}. DATA WILL NOT PERSIST.")
+        self.data_store = {}
 
     def from_(self, table_name: str):
         self._table_name = table_name
         self.data_store.setdefault(table_name, [])
-        return self # Return self for chaining methods
+        return self
 
     def select(self, columns: str = "*"):
         self._last_op = "select"
@@ -86,13 +147,11 @@ class MockSupabaseClient:
         return filtered
 
     async def execute(self):
-        # Simulate async DB operation
         table_data = self.data_store[self._table_name]
         if self._last_op == "insert":
             new_item = self._insert_data.copy()
             if 'id' not in new_item or new_item['id'] is None:
-                # Generate a simple mock ID for tracking
-                new_item['id'] = str(len(table_data) + 1) # Simple ID generator
+                new_item['id'] = str(len(table_data) + 1)
             if 'timestamp' not in new_item:
                 new_item['timestamp'] = datetime.datetime.utcnow().isoformat()
             table_data.append(new_item)
@@ -112,8 +171,4 @@ class MockSupabaseClient:
             return {"data": [], "count": updated_count, "error": None}
         return {"data": [], "error": "Invalid mock operation"}
 
-# You would typically instantiate the real Supabase client like this:
-# from supabase import create_client, Client
-# supabase: Client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
-# For this demo, we'll use the mock:
 supabase = MockSupabaseClient(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])

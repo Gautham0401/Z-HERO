@@ -1,20 +1,49 @@
-# conversational_agent.py
-from fastapi import FastAPI, HTTPException
+# tools/conversational_agent.py
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from vertexai.preview.generative_models import GenerativeModel
 from typing import List, Dict, Any, Optional
+import datetime # For generic_exception_handler
 
 # Import common utilities
 from zhero_common.config import logger, os
-from zhero_common.models import AIResponse, UserQuery
+from zhero_common.models import AIResponse, UserQuery # UserQuery is now Pydantic
+from zhero_common.exceptions import (
+    ZHeroException, ZHeroAgentError,
+    ZHeroInvalidInputError, ZHeroDependencyError, ZHeroVertexAIError
+)
+# NEW: Pub/Sub Publisher instance
+from zhero_common.pubsub_client import pubsub_publisher, initialize_pubsub_publisher
+
 
 app = FastAPI(title="Conversational Agent")
+
+# --- Global Exception Handlers (REQUIRED IN ALL AGENT FILES) ---
+@app.exception_handler(ZHeroException)
+async def zhero_exception_handler(request: Request, exc: ZHeroException):
+    logger.error(f"ZHeroException caught for request {request.url.path}: {exc.message}", exc_info=True, extra={"details": exc.details, "status_code": exc.status_code})
+    return JSONResponse(status_code=exc.status_code, content={"error_type": exc.__class__.__name__,"message": exc.message,"details": exc.details})
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    logger.error(f"HTTPException caught for request {request.url.path}: {exc.detail}", exc_info=True, extra={"status_code": exc.status_code, "request_body": await request.body()})
+    return JSONResponse(status_code=exc.status_code, content={"error_type": "HTTPException","message": exc.detail,"details": getattr(exc, 'body', None)})
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    log_id = f"ERR-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}" # Simple unique ID for error
+    logger.critical(f"Unhandled Exception caught for request {request.url.path} (ID: {log_id}): {exc}", exc_info=True)
+    return JSONResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content={"error_type": "InternalServerError","message": "An unexpected internal server error occurred. Please try again later.","error_id": log_id, "details": str(exc) if app.debug else None})
+# --- END Global Exception Handlers ---
+
 
 conversational_model: Optional[GenerativeModel] = None
 
 @app.on_event("startup")
 async def startup_event():
-    """Initializes Vertex AI Gemini model on application startup."""
     global conversational_model
+    # Initialize Pub/Sub Publisher
+    await initialize_pubsub_publisher()
     try:
         from google.cloud import aiplatform # Ensure this is imported for Vertex AI features
         aiplatform.init(project=os.environ["GCP_PROJECT_ID"], location=os.environ["VERTEX_AI_LOCATION"])
@@ -22,30 +51,29 @@ async def startup_event():
         logger.info("Conversational Agent: Initialized Gemini model for response generation.")
     except Exception as e:
         logger.error(f"Conversational Agent: Failed to initialize Gemini model: {e}", exc_info=True)
-        conversational_model = None
+        raise ZHeroVertexAIError("ConversationalAgent", "Gemini Model", "Failed to initialize Gemini model on startup.", original_error=e)
+
 
 @app.post("/generate_response", response_model=AIResponse, summary="Generates a natural language response")
-async def generate_response(
-    user_id: str,
-    query_text: str,
-    context_info: Dict[str, Any], # e.g., {"retrieved_data": "...", "user_profile": "...", "sentiment": "..."}
-    conversation_history: Optional[List[Dict[str, str]]] = None # {"role": "user/model", "parts": "...}
-):
+async def generate_response(request: UserQuery): # UPDATED to use Pydantic UserQuery validation
     """
     Generates a natural language response based on the user's query,
     provided context, and conversation history.
     """
+    if not request.user_id or not request.query_text:
+        raise ZHeroInvalidInputError(message="User ID and query text are required.")
     if not conversational_model:
-        raise HTTPException(status_code=500, detail="Conversational model (LLM) not initialized.")
+        raise ZHeroDependencyError("ConversationalAgent", "Gemini Model", "Conversational model not initialized.", 500)
+    if pubsub_publisher is None: # Check if Pub/Sub is ready
+        logger.warning("Conversational Agent: Pub/Sub publisher not initialized. Performance metrics won't be logged.")
 
-    logger.info(f"Conversational Agent: Generating response for user {user_id} based on query: '{query_text}'")
 
-    # Combine context and history for the prompt
-    retrieved_data = context_info.get("retrieved_data", "")
-    user_profile = context_info.get("user_profile", {})
-    sentiment = context_info.get("sentiment", "neutral")
+    logger.info(f"Conversational Agent: Generating response for user {request.user_id} based on query: '{request.query_text}'")
 
-    # Adapt tone based on sentiment
+    retrieved_data = request.user_profile_data # context_info.get("retrieved_data", "")
+    user_profile = request.user_profile_data # context_info.get("user_profile", {})
+    sentiment = request.sentiment # context_info.get("sentiment", "neutral")
+
     tone_instruction = ""
     if sentiment == "negative" or sentiment == "frustrated":
         tone_instruction = "Be empathetic and helpful. Acknowledge any difficulty or frustration."
@@ -54,7 +82,6 @@ async def generate_response(
     elif sentiment == "curious":
         tone_instruction = "Provide detailed and engaging explanations, fostering further curiosity."
 
-    # Adapt style based on user profile (mock)
     style_instruction = ""
     if user_profile.get("style") == "formal":
         style_instruction = "Use formal language."
@@ -80,22 +107,16 @@ async def generate_response(
     - If you are unsure or the context is insufficient, politely state so or ask for clarification.
     """
 
-    # Format history for Gemini API (if applicable)
     gemini_history = []
-    if conversation_history:
-        for turn in conversation_history:
+    if request.conversation_history:
+        for turn in request.conversation_history:
             role = "user" if turn["role"] == "user" else "model"
             gemini_history.append({"role": role, "parts": [turn["parts"]]})
 
-    # For simplicity, we just send a single message here.
-    # A real chat session would maintain the history to maintain state.
-    # We send system prompt as part of the content for initial turn.
-    messages = [
-        {"role": "user", "parts": [system_prompt, query_text]}
-    ]
+    messages = [{"role": "user", "parts": [system_prompt, request.query_text]}]
 
     generation_config = {
-        "temperature": 0.7, # Higher temperature for more creative/varied responses
+        "temperature": 0.7,
         "max_output_tokens": 500,
     }
 
@@ -103,23 +124,45 @@ async def generate_response(
         response_stream = await conversational_model.generate_content_async(
             contents=messages,
             generation_config=generation_config
-            # stream=True # For streaming responses
         )
-        # Assuming non-streaming here for simplicity.
         final_response_text = response_stream.candidates[0].text
-        logger.info(f"Conversational Agent: Generated response for {user_id}.")
+        logger.info(f"Conversational Agent: Generated response for {request.user_id}.")
 
-        # In a real setup, source_citations would come from the Orchestration Agent.
-        # This is just a placeholder example.
-        citations = context_info.get("source_citations", [])
+        citations = request.user_profile_data.get("source_citations", []) # Assuming citations are passed via user_profile_data or context_info
+
+        # Optional: Log performance metrics (fire-and-forget)
+        asyncio.create_task(
+            _log_performance_metric_via_pubsub(
+                request.user_id, request.query_text, len(final_response_text), "conversational_agent"
+            )
+        )
 
         return AIResponse(
-            user_id=user_id,
+            user_id=request.user_id,
             response_text=final_response_text,
             source_citations=citations
         )
     except Exception as e:
-        logger.error(f"Conversational Agent: Error generating response for {user_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to generate response: {e}")
+        raise ZHeroVertexAIError("ConversationalAgent", "Gemini Model", f"Error generating response from Gemini: {e}", original_error=e)
 
-# To run this agent: uvicorn conversational_agent:app --port 8004 --reload
+# Helper function for logging performance metrics via Pub/Sub (replicated for modularity)
+async def _log_performance_metric_via_pubsub(user_id: str, query_text: str, response_length: int, agent_name: str):
+    if pubsub_publisher:
+        try:
+            await pubsub_publisher.publish_message(
+                "performance_metrics",
+                AgentPerformanceMetric(
+                    agent_name=agent_name,
+                    user_id=user_id,
+                    metric_name="query_processed",
+                    value=1.0,
+                    context={"query": query_text, "response_length": response_length}
+                ).model_dump(exclude_unset=True)
+            )
+            logger.info(f"{agent_name} Performance metric logged via Pub/Sub for user {user_id}.")
+        except ZHeroException as e:
+            logger.error(f"{agent_name}: Failed to log performance metric (ZHeroException): {e.message}", exc_info=True)
+        except Exception as e:
+            logger.error(f"{agent_name}: Failed to log performance metric (unexpected): {e}", exc_info=True)
+    else:
+        logger.warning(f"{agent_name}: Pub/Sub publisher not initialized. Cannot log performance metric.")
