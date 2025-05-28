@@ -1,4 +1,5 @@
 # tools/conversational_agent.py
+
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from vertexai.preview.generative_models import GenerativeModel
@@ -12,8 +13,10 @@ from zhero_common.exceptions import (
     ZHeroException, ZHeroAgentError,
     ZHeroInvalidInputError, ZHeroDependencyError, ZHeroVertexAIError
 )
-# NEW: Pub/Sub Publisher instance
+# NEW: Pub/Sub Publisher instance - KEPT because initialize_pubsub_publisher is needed
 from zhero_common.pubsub_client import pubsub_publisher, initialize_pubsub_publisher
+# NEW: Import metrics helper
+from zhero_common.metrics import log_performance_metric, PerformanceMetricName # <--- NEW IMPORT
 
 
 app = FastAPI(title="Conversational Agent")
@@ -42,15 +45,32 @@ conversational_model: Optional[GenerativeModel] = None
 @app.on_event("startup")
 async def startup_event():
     global conversational_model
-    # Initialize Pub/Sub Publisher
-    await initialize_pubsub_publisher()
+    # Initialize Pub/Sub Publisher (this is crucial for metric logging!)
+    # This ensures pubsub_publisher is ready before any metric calls are made.
+    await initialize_pubsub_publisher() # <--- KEPT THIS HERE
+
     try:
         from google.cloud import aiplatform # Ensure this is imported for Vertex AI features
         aiplatform.init(project=os.environ["GCP_PROJECT_ID"], location=os.environ["VERTEX_AI_LOCATION"])
         conversational_model = GenerativeModel(os.environ["GEMINI_PRO_MODEL_ID"])
         logger.info("Conversational Agent: Initialized Gemini model for response generation.")
+        # Log successful startup metric
+        asyncio.create_task( # <--- NEW METRIC LOGGING
+            log_performance_metric(
+                agent_name="conversational_agent",
+                metric_name=PerformanceMetricName.AGENT_STARTUP_SUCCESS
+            )
+        )
     except Exception as e:
         logger.error(f"Conversational Agent: Failed to initialize Gemini model: {e}", exc_info=True)
+        # Log failed startup metric
+        asyncio.create_task( # <--- NEW METRIC LOGGING
+            log_performance_metric(
+                agent_name="conversational_agent",
+                metric_name=PerformanceMetricName.AGENT_STARTUP_FAILURE,
+                context={"error": str(e)}
+            )
+        )
         raise ZHeroVertexAIError("ConversationalAgent", "Gemini Model", "Failed to initialize Gemini model on startup.", original_error=e)
 
 
@@ -64,8 +84,10 @@ async def generate_response(request: UserQuery): # UPDATED to use Pydantic UserQ
         raise ZHeroInvalidInputError(message="User ID and query text are required.")
     if not conversational_model:
         raise ZHeroDependencyError("ConversationalAgent", "Gemini Model", "Conversational model not initialized.", 500)
-    if pubsub_publisher is None: # Check if Pub/Sub is ready
-        logger.warning("Conversational Agent: Pub/Sub publisher not initialized. Performance metrics won't be logged.")
+    # The check for pubsub_publisher should now be removed from here,
+    # as it's handled gracefully within log_performance_metric internally.
+    # if pubsub_publisher is None: # Check if Pub/Sub is ready
+    #     logger.warning("Conversational Agent: Pub/Sub publisher not initialized. Performance metrics won't be logged.")
 
 
     logger.info(f"Conversational Agent: Generating response for user {request.user_id} based on query: '{request.query_text}'")
@@ -107,13 +129,17 @@ async def generate_response(request: UserQuery): # UPDATED to use Pydantic UserQ
     - If you are unsure or the context is insufficient, politely state so or ask for clarification.
     """
 
+    # conversation history (if needed)
     gemini_history = []
     if request.conversation_history:
         for turn in request.conversation_history:
-            role = "user" if turn["role"] == "user" else "model"
-            gemini_history.append({"role": role, "parts": [turn["parts"]]})
+            # Assuming 'role' could be "human" or "ai" or similar from conversation_history
+            # Gemini models expect "user" and "model"
+            role = "user" if turn["role"] == "user" else "model" # Adjust based on your actual conversation_history format
+            gemini_history.append({"role": role, "parts": [turn["parts"]]}) # Adjust if 'parts' is not a single string/dict
 
     messages = [{"role": "user", "parts": [system_prompt, request.query_text]}]
+
 
     generation_config = {
         "temperature": 0.7,
@@ -130,10 +156,22 @@ async def generate_response(request: UserQuery): # UPDATED to use Pydantic UserQ
 
         citations = request.user_profile_data.get("source_citations", []) # Assuming citations are passed via user_profile_data or context_info
 
-        # Optional: Log performance metrics (fire-and-forget)
-        asyncio.create_task(
-            _log_performance_metric_via_pubsub(
-                request.user_id, request.query_text, len(final_response_text), "conversational_agent"
+        # Log performance metrics using the new helper
+        asyncio.create_task( # <--- REPLACED OLD _log_performance_metric_via_pubsub
+            log_performance_metric(
+                agent_name="conversational_agent",
+                metric_name=PerformanceMetricName.QUERY_PROCESSED, # Or PerformanceMetricName.CONVERSATION_TURN
+                value=1.0,
+                user_id=request.user_id,
+                context={"query": request.query_text, "response_length": len(final_response_text)}
+            )
+        )
+        asyncio.create_task( # <--- NEW SPECIFIC METRIC GEMINI GENERATION SUCCESS
+            log_performance_metric(
+                agent_name="conversational_agent",
+                metric_name=PerformanceMetricName.GEMINI_GENERATION_SUCCESS,
+                user_id=request.user_id,
+                context={"query_length": len(request.query_text), "response_length": len(final_response_text)}
             )
         )
 
@@ -143,26 +181,17 @@ async def generate_response(request: UserQuery): # UPDATED to use Pydantic UserQ
             source_citations=citations
         )
     except Exception as e:
+        # Log Gemini generation failure
+        asyncio.create_task( # <--- NEW SPECIFIC METRIC GEMINI GENERATION FAILURE
+            log_performance_metric(
+                agent_name="conversational_agent",
+                metric_name=PerformanceMetricName.GEMINI_GENERATION_FAILURE,
+                user_id=request.user_id,
+                context={"query": request.query_text, "error": str(e)}
+            )
+        )
         raise ZHeroVertexAIError("ConversationalAgent", "Gemini Model", f"Error generating response from Gemini: {e}", original_error=e)
 
-# Helper function for logging performance metrics via Pub/Sub (replicated for modularity)
-async def _log_performance_metric_via_pubsub(user_id: str, query_text: str, response_length: int, agent_name: str):
-    if pubsub_publisher:
-        try:
-            await pubsub_publisher.publish_message(
-                "performance_metrics",
-                AgentPerformanceMetric(
-                    agent_name=agent_name,
-                    user_id=user_id,
-                    metric_name="query_processed",
-                    value=1.0,
-                    context={"query": query_text, "response_length": response_length}
-                ).model_dump(exclude_unset=True)
-            )
-            logger.info(f"{agent_name} Performance metric logged via Pub/Sub for user {user_id}.")
-        except ZHeroException as e:
-            logger.error(f"{agent_name}: Failed to log performance metric (ZHeroException): {e.message}", exc_info=True)
-        except Exception as e:
-            logger.error(f"{agent_name}: Failed to log performance metric (unexpected): {e}", exc_info=True)
-    else:
-        logger.warning(f"{agent_name}: Pub/Sub publisher not initialized. Cannot log performance metric.")
+# REMOVED OLD HELPER FUNCTION: _log_performance_metric_via_pubsub is no longer needed here
+# async def _log_performance_metric_via_pubsub(...)
+#     ...

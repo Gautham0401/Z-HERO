@@ -1,4 +1,5 @@
 # agents/meta_agent.py
+
 from fastapi import FastAPI, HTTPException, status, Request
 from fastapi.responses import JSONResponse
 from typing import Dict, Any, List, Optional
@@ -27,6 +28,8 @@ from zhero_common.exceptions import (
 )
 # NEW: Pub/Sub Publisher instance
 from zhero_common.pubsub_client import pubsub_publisher, initialize_pubsub_publisher
+# NEW: Import metrics helper
+from zhero_common.metrics import log_performance_metric, PerformanceMetricName # <--- NEW
 
 # Instantiate the ReadSystemLogsTool here, as it's a class and is used in the CrewAI Agent/Task definitions
 read_system_logs_tool_instance = ReadSystemLogsTool()
@@ -68,8 +71,21 @@ async def startup_event():
             location=os.environ["VERTEX_AI_LOCATION"]
         )
         logger.info("Meta-Agent: Initialized CrewAI LLM (ChatVertexAI).")
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="meta_agent",
+                metric_name=PerformanceMetricName.AGENT_STARTUP_SUCCESS
+            )
+        )
     except Exception as e:
         logger.error(f"Meta-Agent: Failed to initialize CrewAI LLM (ChatVertexAI): {e}", exc_info=True)
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="meta_agent",
+                metric_name=PerformanceMetricName.AGENT_STARTUP_FAILURE,
+                context={"error": str(e)}
+            )
+        )
         raise ZHeroVertexAIError("MetaAgent", "CrewAI LLM", "Failed to initialize CrewAI LLM on startup.", original_error=e)
 
     # Schedule the periodic self-reflection task to run in the background
@@ -90,10 +106,28 @@ async def log_performance(metric: AgentPerformanceMetric):
         response = await supabase.from_("agent_performance_logs").insert(metric_data).execute()
         if response["error"]:
             raise ZHeroSupabaseError(agent_name="MetaAgent", message=response["error"]["message"], original_error=response["error"])
+        # No extra metric to log here because this endpoint *receives* the performance metric
+        # and simply stores it. The original sender is responsible for logging the event.
         return {"status": "logged", "metric_id": response["data"][0].get('id')}
     except ZHeroException:
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="meta_agent",
+                metric_name=PerformanceMetricName.AGENT_API_CALL_FAILURE, # <--- NEW
+                value=1.0,
+                context={"endpoint": "/log_performance", "error": "ZHeroException", "metric_name": metric.metric_name, "agent_name": metric.agent_name},
+            )
+        )
         raise
     except Exception as e:
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="meta_agent",
+                metric_name=PerformanceMetricName.AGENT_API_CALL_FAILURE, # <--- NEW
+                value=1.0,
+                context={"endpoint": "/log_performance", "error": str(e), "type": "unexpected"},
+            )
+        )
         raise ZHeroAgentError("MetaAgent", "Error logging performance metric.", original_error=e)
 
 @app.post("/log_knowledge_gap_event", summary="Logs an internal knowledge gap event for review by the Learning Agent (via Pub/Sub Push/direct call)")
@@ -129,10 +163,36 @@ async def log_knowledge_gap_event(trigger: LearningTrigger):
         response = await supabase.from_("knowledge_gaps").insert(gap_data).execute()
         if response["error"]:
             raise ZHeroSupabaseError(agent_name="MetaAgent", message=response["error"]["message"], original_error=response["error"])
+        
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="meta_agent",
+                metric_name=PerformanceMetricName.KNOWLEDGE_GAP_CREATED, # <--- NEW
+                value=1.0, user_id=user_id,
+                context={"query_text": query_text, "reason": reason, "gap_id": response["data"][0].get('id')}
+            )
+        )
+
         return {"status": "logged", "gap_id": response["data"][0].get('id')}
     except ZHeroException:
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="meta_agent",
+                metric_name=PerformanceMetricName.KNOWLEDGE_GAP_CREATED, # <--- NEW
+                value=0.0, user_id=user_id, # Log failure
+                context={"query_text": query_text, "reason": reason, "error": "ZHeroException"}
+            )
+        )
         raise
     except Exception as e:
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="meta_agent",
+                metric_name=PerformanceMetricName.KNOWLEDGE_GAP_CREATED, # <--- NEW
+                value=0.0, user_id=user_id, # Log failure
+                context={"query_text": query_text, "reason": reason, "error": str(e), "type": "unexpected"}
+            )
+        )
         raise ZHeroAgentError("MetaAgent", "Error logging knowledge gap event.", original_error=e)
 
 @app.post("/get_knowledge_gaps", response_model=Dict[str, List[KnowledgeGap]], summary="Retrieves unaddressed knowledge gaps")
@@ -142,6 +202,7 @@ async def get_knowledge_gaps(request: GetKnowledgeGapsRequest):
     Called by the Learning Agent.
     """
     logger.info(f"Meta-Agent: Retrieving {request.limit} knowledge gaps with status '{request.status}'")
+    start_time = datetime.datetime.now() # <--- NEW
     try:
         response = await supabase.from_("knowledge_gaps").select("*").eq("status", request.status).limit(request.limit).execute()
         if response["error"]:
@@ -149,10 +210,38 @@ async def get_knowledge_gaps(request: GetKnowledgeGapsRequest):
 
         gaps_list = [KnowledgeGap(**item) for item in response["data"]]
         logger.info(f"Meta-Agent: Retrieved {len(gaps_list)} gaps.")
+        
+        end_time = datetime.datetime.now() # <--- NEW
+        duration_ms = (end_time - start_time).total_seconds() * 1000 # <--- NEW
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="meta_agent",
+                metric_name=PerformanceMetricName.TOOL_CALL_SUCCESS, # Generic success
+                value=1.0,
+                context={"tool_name": "get_knowledge_gaps_supabase", "count": len(gaps_list), "duration_ms": duration_ms}
+            )
+        )
+
         return {"gaps": gaps_list}
     except ZHeroException:
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="meta_agent",
+                metric_name=PerformanceMetricName.TOOL_CALL_FAILURE, # <--- NEW
+                value=1.0,
+                context={"tool_name": "get_knowledge_gaps_supabase", "error": "ZHeroException"}
+            )
+        )
         raise
     except Exception as e:
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="meta_agent",
+                metric_name=PerformanceMetricName.TOOL_CALL_FAILURE, # <--- NEW
+                value=1.0,
+                context={"tool_name": "get_knowledge_gaps_supabase", "error": str(e), "type": "unexpected"}
+            )
+        )
         raise ZHeroAgentError("MetaAgent", "Error retrieving knowledge gaps.", original_error=e)
 
 @app.post("/mark_gap_as_addressed", summary="Marks a knowledge gap as addressed")
@@ -161,18 +250,46 @@ async def mark_gap_as_addressed(request: MarkGapAsAddressedRequest):
     Marks a specific knowledge gap as addressed (or in progress).
     """
     logger.info(f"Meta-Agent: Marking gap {request.gap_id} as '{request.status}'")
+    start_time = datetime.datetime.now() # <--- NEW
     try:
         response = await supabase.from_("knowledge_gaps").update({"status": request.status}).eq("id", request.gap_id).execute()
         if response["error"]:
             raise ZHeroSupabaseError(agent_name="MetaAgent", message=response["error"]["message"], original_error=response["error"])
-        
+            
         if not response["data"] and response["count"] == 0:
             raise ZHeroNotFoundError(resource_name="Knowledge Gap", identifier=request.gap_id)
 
+        end_time = datetime.datetime.now() # <--- NEW
+        duration_ms = (end_time - start_time).total_seconds() * 1000 # <--- NEW
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="meta_agent",
+                metric_name=PerformanceMetricName.KNOWLEDGE_GAP_HANDLED, # <--- NEW
+                value=1.0,
+                context={"gap_id": request.gap_id, "new_status": request.status, "duration_ms": duration_ms}
+            )
+        )
+
         return {"status": "success", "gap_id": request.gap_id, "updated_status": request.status}
     except ZHeroException:
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="meta_agent",
+                metric_name=PerformanceMetricName.KNOWLEDGE_GAP_HANDLED, # <--- NEW
+                value=0.0,
+                context={"gap_id": request.gap_id, "new_status": request.status, "error": "ZHeroException"}
+            )
+        )
         raise
     except Exception as e:
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="meta_agent",
+                metric_name=PerformanceMetricName.KNOWLEDGE_GAP_HANDLED, # <--- NEW
+                value=0.0,
+                context={"gap_id": request.gap_id, "new_status": request.status, "error": str(e), "type": "unexpected"}
+            )
+        )
         raise ZHeroAgentError("MetaAgent", "Error marking gap as addressed.", original_error=e)
 
 
@@ -185,11 +302,12 @@ async def run_crewai_self_optimization_crew() -> Dict[str, Any]:
     """
     if not crew_llm_instance:
         raise ZHeroVertexAIError("MetaAgent", "CrewAI LLM", "CrewAI LLM not initialized. Cannot run self-optimization crew.")
-    if pubsub_publisher is None: # Check if Pub/Sub is ready
-        raise ZHeroDependencyError("MetaAgent", "Pub/Sub", "Pub/Sub publisher not initialized.", 500)
-
+    # Pubsub_publisher check is handled by log_performance_metric itself
+    # if pubsub_publisher is None: # Check if Pub/Sub is ready
+    #    raise ZHeroDependencyError("MetaAgent", "Pub/Sub", "Pub/Sub publisher not initialized. Cannot run CrewAI tasks that publish.", 500)
 
     logger.info("Meta-Agent: Initiating CrewAI Self-Optimization Crew.")
+    crew_start_time = datetime.datetime.now() # <--- NEW
 
     # 1. Gather raw data before passing to CrewAI agents
     try:
@@ -244,7 +362,25 @@ async def run_crewai_self_optimization_crew() -> Dict[str, Any]:
     try:
         crew_result_str = await asyncio.to_thread(self_optimization_crew.kickoff)
         logger.info(f"Meta-Agent: CrewAI Self-Optimization Crew finished. Raw result: {crew_result_str[:200]}...")
+        crew_end_time = datetime.datetime.now() # <--- NEW
+        crew_duration_ms = (crew_end_time - crew_start_time).total_seconds() * 1000 # <--- NEW
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="meta_agent",
+                metric_name=PerformanceMetricName.TOOL_CALL_SUCCESS, # Generic metric for crew execution
+                value=1.0,
+                context={"tool_name": "crewai_self_optimization", "duration_ms": crew_duration_ms},
+            )
+        )
     except Exception as e:
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="meta_agent",
+                metric_name=PerformanceMetricName.TOOL_CALL_FAILURE, # <--- NEW
+                value=1.0,
+                context={"tool_name": "crewai_self_optimization", "error": str(e), "type": "crew_kickoff_failure"},
+            )
+        )
         raise ZHeroAgentError("MetaAgent", "CrewAI Self-Optimization Crew kickoff failed.", original_error=e)
 
     # 3. Parse CrewAI output and trigger actions (crucial for self-evolution)
@@ -259,6 +395,7 @@ async def run_crewai_self_optimization_crew() -> Dict[str, Any]:
         }
 
         # Example of parsing a specific recommendation (as before)
+        # You might extend this parsing logic based on CrewAI's output format
         if "recommendation: Learning Agent should prioritize proactive research" in crew_result_str:
             topic_match = re.search(r"recommendation: Learning Agent should prioritize proactive research in '(.*?)'", crew_result_str)
             topic = topic_match.group(1) if topic_match else "unspecified_topic"
@@ -269,8 +406,13 @@ async def run_crewai_self_optimization_crew() -> Dict[str, Any]:
                 "reason": "Identified by Meta-Agent Crew for proactive research."
             })
 
-        await pubsub_publisher.publish_message("self_optimization_plans", pubsub_message_data)
-        logger.info("Meta-Agent: Published self-optimization plan to Pub/Sub.")
+        # Ensure pubsub_publisher is available here for publishing the self_optimization_plans
+        if pubsub_publisher:
+            await pubsub_publisher.publish_message("self_optimization_plans", pubsub_message_data)
+            logger.info("Meta-Agent: Published self-optimization plan to Pub/Sub.")
+        else:
+            logger.warning("Meta-Agent: Pub/Sub publisher not ready to publish self-optimization plan.")
+
     except ZHeroException as e:
         logger.error(f"Meta-Agent: Failed to publish self-optimization plan to Pub/Sub (ZHeroException): {e.message}", exc_info=True)
     except Exception as e:
@@ -281,24 +423,64 @@ async def run_crewai_self_optimization_crew() -> Dict[str, Any]:
 
 @app.post("/trigger_crewai_self_optimization", summary="Triggers a CrewAI process for self-optimization")
 async def trigger_crewai_self_optimization_endpoint() -> Dict[str, Any]:
+    start_time = datetime.datetime.now() # <--- NEW
     try:
         result = await run_crewai_self_optimization_crew()
+        end_time = datetime.datetime.now() # <--- NEW
+        duration_ms = (end_time - start_time).total_seconds() * 1000 # <--- NEW
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="meta_agent",
+                metric_name=PerformanceMetricName.QUERY_PROCESSED, # <--- NEW
+                value=1.0,
+                context={"endpoint": "/trigger_crewai_self_optimization", "duration_ms": duration_ms}
+            )
+        )
         return {"message": "CrewAI self-optimization initiated", "result": result}
     except ZHeroException:
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="meta_agent",
+                metric_name=PerformanceMetricName.QUERY_PROCESSED, # <--- NEW
+                value=0.0, # Log failure
+                context={"endpoint": "/trigger_crewai_self_optimization", "error": "ZHeroException"}
+            )
+        )
         raise
     except Exception as e:
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="meta_agent",
+                metric_name=PerformanceMetricName.QUERY_PROCESSED, # <--- NEW
+                value=0.0, # Log failure
+                context={"endpoint": "/trigger_crewai_self_optimization", "error": str(e), "type": "unexpected"}
+            )
+        )
         raise ZHeroAgentError("MetaAgent", "Failed to trigger CrewAI self-optimization endpoint.", original_error=e)
 
 
 # --- Periodic self-reflection task ---
 async def periodic_self_reflection_task():
+    logger.info("Meta-Agent (Periodic): Delaying initial self-reflection for startup.") # <--- NEW CLARIFICATION
     await asyncio.sleep(10) # Initial delay for startup
     while True:
         logger.info("Meta-Agent (Periodic): Initiating scheduled self-reflection cycle...")
+        task_start_time = datetime.datetime.now() # <--- NEW
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="meta_agent",
+                metric_name=PerformanceMetricName.QUERY_PROCESSED, # Log task start
+                value=1.0,
+                context={"task_type": "periodic_self_reflection", "status": "started"}
+            )
+        )
+
         if not crew_llm_instance:
             logger.warning("Meta-Agent (Periodic): CrewAI LLM not initialized. Skipping advanced self-reflection.")
             await asyncio.sleep(60 * 60) # Try again in an hour if LLM is not ready
             continue
+        # Pubsub_publisher check handled by log_performance_metric for the metric itself
+        # This check is more specific for publishing the *plan*
         if pubsub_publisher is None: # Check if Pub/Sub is ready
             logger.warning("Meta-Agent (Periodic): Pub/Sub publisher not initialized. Cannot publish recommendations.")
             await asyncio.sleep(60 * 60)
@@ -307,9 +489,35 @@ async def periodic_self_reflection_task():
         try:
             await run_crewai_self_optimization_crew()
             logger.info("Meta-Agent (Periodic): Scheduled CrewAI Self-Optimization Crew completed.")
+            task_end_time = datetime.datetime.now() # <--- NEW
+            task_duration_ms = (task_end_time - task_start_time).total_seconds() * 1000 # <--- NEW
+            asyncio.create_task( # <--- NEW
+                log_performance_metric(
+                    agent_name="meta_agent",
+                    metric_name=PerformanceMetricName.QUERY_PROCESSED, # Log task end
+                    value=1.0,
+                    context={"task_type": "periodic_self_reflection", "status": "completed", "duration_ms": task_duration_ms}
+                )
+            )
         except ZHeroException as e:
             logger.error(f"Meta-Agent (Periodic): Error during scheduled self-reflection (ZHeroException): {e.message}", exc_info=True)
+            asyncio.create_task( # <--- NEW
+                log_performance_metric(
+                    agent_name="meta_agent",
+                    metric_name=PerformanceMetricName.QUERY_PROCESSED, # Log task failure
+                    value=0.0,
+                    context={"task_type": "periodic_self_reflection", "status": "failed", "error": e.message}
+                )
+            )
         except Exception as e:
             logger.error(f"Meta-Agent (Periodic): Error during scheduled self-reflection (unexpected error): {e}", exc_info=True)
+            asyncio.create_task( # <--- NEW
+                log_performance_metric(
+                    agent_name="meta_agent",
+                    metric_name=PerformanceMetricName.QUERY_PROCESSED, # Log task failure
+                    value=0.0,
+                    context={"task_type": "periodic_self_reflection", "status": "failed", "error": str(e), "type": "unexpected"}
+                )
+            )
 
         await asyncio.sleep(60 * 60 * 24)  # Run every 24 hours

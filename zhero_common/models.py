@@ -65,7 +65,7 @@ class KnowledgeItem(BaseModel):
     rack: Optional[str] = Field(None, min_length=1, max_length=100)
     book: Optional[str] = Field(None, min_length=1, max_length=100)
     embeddings: Optional[List[float]] = None
-    timestamp: datetime.datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime.datetime = Field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
     score: Optional[float] = None
 
 class KnowledgeSearchQuery(BaseRequest):

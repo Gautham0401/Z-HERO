@@ -5,7 +5,7 @@ from fastapi import HTTPException
 from typing import Dict, Any, Optional
 from tenacity import (
     retry, wait_exponential, stop_after_attempt, retry_if_exception_type,
-    CircuitBreakerError, before_sleep_log
+    before_sleep_log
 )
 import logging
 import datetime # For MockSupabaseClient timestamp

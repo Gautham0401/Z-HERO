@@ -1,4 +1,5 @@
 # tools/knowledge_management_agent.py
+
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from google.cloud import aiplatform
@@ -19,6 +20,8 @@ from zhero_common.exceptions import (
 )
 # NEW: Pub/Sub Publisher instance
 from zhero_common.pubsub_client import pubsub_publisher, initialize_pubsub_publisher
+# NEW: Import metrics helper
+from zhero_common.metrics import log_performance_metric, PerformanceMetricName # <--- NEW
 
 
 app = FastAPI(title="Knowledge Management Agent")
@@ -48,7 +51,7 @@ matching_engine_index_endpoint: Optional[MatchingEngineIndexEndpoint] = None
 @app.on_event("startup")
 async def startup_event():
     global embedding_model, matching_engine_index_endpoint
-    # Initialize Pub/Sub Publisher
+    # Initialize Pub/Sub Publisher (this is crucial for metric logging!)
     await initialize_pubsub_publisher()
 
     try:
@@ -60,8 +63,22 @@ async def startup_event():
             os.environ["VERTEX_AI_EMBEDDING_MODEL_ID"]
         )
         logger.info("Knowledge Management Agent: Initialized Vertex AI Embeddings model.")
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="knowledge_management_agent",
+                metric_name=PerformanceMetricName.AGENT_STARTUP_SUCCESS,
+                context={"model": os.environ["VERTEX_AI_EMBEDDING_MODEL_ID"], "component": "embedding_model"}
+            )
+        )
     except Exception as e:
         logger.error(f"Knowledge Management Agent: Failed to initialize embedding model: {e}", exc_info=True)
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="knowledge_management_agent",
+                metric_name=PerformanceMetricName.AGENT_STARTUP_FAILURE,
+                context={"model": os.environ["VERTEX_AI_EMBEDDING_MODEL_ID"], "component": "embedding_model", "error": str(e)}
+            )
+        )
         raise ZHeroVertexAIError("KnowledgeManagementAgent", "Embeddings Model", "Failed to initialize embeddings model on startup.", original_error=e)
 
     try:
@@ -69,8 +86,22 @@ async def startup_event():
             index_endpoint_name=os.environ["VERTEX_AI_SEARCH_ENDPOINT_ID"]
         )
         logger.info("Knowledge Management Agent: Initialized Vertex AI Search Index Endpoint.")
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="knowledge_management_agent",
+                metric_name=PerformanceMetricName.AGENT_STARTUP_SUCCESS,
+                context={"index_endpoint_id": os.environ["VERTEX_AI_SEARCH_ENDPOINT_ID"], "component": "matching_engine"}
+            )
+        )
     except Exception as e:
         logger.error(f"Knowledge Management Agent: Failed to initialize Vertex AI Search Index Endpoint: {e}", exc_info=True)
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="knowledge_management_agent",
+                metric_name=PerformanceMetricName.AGENT_STARTUP_FAILURE,
+                context={"index_endpoint_id": os.environ["VERTEX_AI_SEARCH_ENDPOINT_ID"], "component": "matching_engine", "error": str(e)}
+            )
+        )
         raise ZHeroVertexAIError("KnowledgeManagementAgent", "Vertex AI Search", "Failed to initialize Matching Engine endpoint on startup.", original_error=e)
 
 
@@ -88,35 +119,112 @@ async def ingest_knowledge(item: KnowledgeItem): # Uses Pydantic model for valid
     if not embedding_model:
         raise ZHeroDependencyError("KnowledgeManagementAgent", "Embeddings Model", "Embedding model not initialized.", 500)
 
-
     logger.info(f"Knowledge Management Agent: Received ingestion for '{item.title or item.content[:50]}...' (User: {item.user_id})")
+    start_time = datetime.datetime.now() # <--- NEW
 
     try:
-        embeddings_response = embedding_model.predict([item.content])
+        embedding_start = datetime.datetime.now() # <--- NEW
+        embeddings_response = await asyncio.to_thread(embedding_model.predict, [item.content]) # <--- UPDATED to use asyncio.to_thread
         item.embeddings = embeddings_response.embeddings[0].values
         logger.info("Knowledge Management Agent: Embeddings generated.")
+        embedding_end = datetime.datetime.now() # <--- NEW
+        embedding_duration_ms = (embedding_end - embedding_start).total_seconds() * 1000 # <--- NEW
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="knowledge_management_agent",
+                metric_name=PerformanceMetricName.GEMINI_GENERATION_SUCCESS,
+                value=1.0, user_id=item.user_id,
+                context={"model": os.environ["VERTEX_AI_EMBEDDING_MODEL_ID"], "duration_ms": embedding_duration_ms, "task": "embedding_generation"}
+            )
+        )
 
         if matching_engine_index_endpoint:
             try:
+                # In a real scenario, you'd upsert to Matching Engine here
                 logger.info(f"Knowledge Management Agent: Simulating storage of embedding in Vertex AI Search for {item.user_id}.")
+                # Example: matching_engine_index_endpoint.upsert_datapooints(items=[{"id": item.id, "embedding": item.embeddings}])
             except Exception as e:
+                asyncio.create_task( # <--- NEW
+                    log_performance_metric(
+                        agent_name="knowledge_management_agent",
+                        metric_name=PerformanceMetricName.TOOL_CALL_FAILURE,
+                        value=1.0, user_id=item.user_id,
+                        context={"tool_name": "vertex_ai_search_upsert", "error": str(e)}
+                    )
+                )
                 raise ZHeroVertexAIError("KnowledgeManagementAgent", "Vertex AI Search", "Failed to upsert data to Matching Engine.", original_error=e)
         else:
             logger.warning("Knowledge Management Agent: Matching Engine not initialized. Only metadata will be stored.")
 
+        supabase_start = datetime.datetime.now() # <--- NEW
         item.id = item.id if item.id else str(datetime.datetime.utcnow().timestamp())
         item_data_for_supabase = item.model_dump(exclude={"embeddings"}, exclude_unset=True)
         item_data_for_supabase["timestamp"] = item_data_for_supabase["timestamp"].isoformat()
 
         response = await supabase.from_("knowledge_items").insert(item_data_for_supabase).execute()
         if response["error"]:
+            asyncio.create_task( # <--- NEW
+                log_performance_metric(
+                    agent_name="knowledge_management_agent",
+                    metric_name=PerformanceMetricName.TOOL_CALL_FAILURE,
+                    value=1.0, user_id=item.user_id,
+                    context={"tool_name": "supabase_insert", "error": response["error"].get("message")}
+                )
+            )
             raise ZHeroSupabaseError(agent_name="KnowledgeManagementAgent", message=response["error"]["message"], original_error=response["error"])
 
+        supabase_end = datetime.datetime.now() # <--- NEW
+        supabase_duration_ms = (supabase_end - supabase_start).total_seconds() * 1000 # <--- NEW
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="knowledge_management_agent",
+                metric_name=PerformanceMetricName.TOOL_CALL_SUCCESS,
+                value=1.0, user_id=item.user_id,
+                context={"tool_name": "supabase_insert", "duration_ms": supabase_duration_ms}
+            )
+        )
+
         logger.info(f"Knowledge Management Agent: Knowledge item '{item.title}' ingested and metadata stored successfully.")
+        
+        end_time = datetime.datetime.now() # <--- NEW
+        total_duration_ms = (end_time - start_time).total_seconds() * 1000 # <--- NEW
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="knowledge_management_agent",
+                metric_name=PerformanceMetricName.KNOWLEDGE_INGESTED,
+                value=1.0, user_id=item.user_id,
+                context={"item_id": item.id, "title": item.title, "total_duration_ms": total_duration_ms}
+            )
+        )
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="knowledge_management_agent",
+                metric_name=PerformanceMetricName.API_CALL_LATENCY_MS, # <--- NEW
+                value=total_duration_ms, user_id=item.user_id,
+                context={"endpoint": "/ingest_knowledge", "type": "api_latency"}
+            )
+        )
+
         return {"status": "success", "id": item.id}
     except ZHeroException:
+        asyncio.create_task( # <--- NEW - Log ingestion failure before re-raise
+            log_performance_metric(
+                agent_name="knowledge_management_agent",
+                metric_name=PerformanceMetricName.KNOWLEDGE_INGESTED,
+                value=0.0, user_id=item.user_id,
+                context={"item_id": item.id, "title": item.title, "error": "ZHeroException"}
+            )
+        )
         raise
     except Exception as e:
+        asyncio.create_task( # <--- NEW - Log ingestion failure before re-raise
+            log_performance_metric(
+                agent_name="knowledge_management_agent",
+                metric_name=PerformanceMetricName.KNOWLEDGE_INGESTED,
+                value=0.0, user_id=item.user_id,
+                context={"item_id": item.id, "title": item.title, "error": str(e), "type": "unexpected"}
+            )
+        )
         raise ZHeroAgentError("KnowledgeManagementAgent", "Error during knowledge ingestion.", original_error=e)
 
 
@@ -136,11 +244,23 @@ async def search_knowledge_semantic(request: KnowledgeSearchQuery): # Uses Pydan
         raise ZHeroInvalidInputError(message="User ID is required for semantic search.")
 
     logger.info(f"Knowledge Management Agent: Received semantic search request for '{request.query_text}' (User: {request.user_id})")
+    start_time = datetime.datetime.now() # <--- NEW
 
     try:
-        embeddings_response = embedding_model.predict([request.query_text])
+        embedding_start = datetime.datetime.now() # <--- NEW
+        embeddings_response = await asyncio.to_thread(embedding_model.predict, [request.query_text]) # <--- UPDATED to use asyncio.to_thread
         query_embedding = embeddings_response.embeddings[0].values
         logger.info("Knowledge Management Agent: Query embedding generated.")
+        embedding_end = datetime.datetime.now() # <--- NEW
+        embedding_duration_ms = (embedding_end - embedding_start).total_seconds() * 1000 # <--- NEW
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="knowledge_management_agent",
+                metric_name=PerformanceMetricName.GEMINI_GENERATION_SUCCESS,
+                value=1.0, user_id=request.user_id,
+                context={"model": os.environ["VERTEX_AI_EMBEDDING_MODEL_ID"], "duration_ms": embedding_duration_ms, "task": "query_embedding"}
+            )
+        )
 
         restricts = [{"namespace": "user_id", "allow_list": [request.user_id]}]
         if request.filter_by_racks:
@@ -148,21 +268,53 @@ async def search_knowledge_semantic(request: KnowledgeSearchQuery): # Uses Pydan
         if request.filter_by_books:
             restricts.append({"namespace": "book", "allow_list": request.filter_by_books})
 
-        results = matching_engine_index_endpoint.find_neighbors(
+        matching_engine_start = datetime.datetime.now() # <--- NEW
+        # Using asyncio.to_thread for blocking calls to Matching Engine
+        results = await asyncio.to_thread(matching_engine_index_endpoint.find_neighbors,
             queries=[query_embedding],
             num_neighbors=request.top_k,
             restricts=restricts
         )
         logger.info(f"Knowledge Management Agent: Vector search completed, found {len(results[0])} raw neighbors.")
+        matching_engine_end = datetime.datetime.now() # <--- NEW
+        matching_engine_duration_ms = (matching_engine_end - matching_engine_start).total_seconds() * 1000 # <--- NEW
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="knowledge_management_agent",
+                metric_name=PerformanceMetricName.TOOL_CALL_SUCCESS,
+                value=1.0, user_id=request.user_id,
+                context={"tool_name": "vertex_ai_search_find_neighbors", "count": len(results[0]), "duration_ms": matching_engine_duration_ms}
+            )
+        )
+
 
         retrieved_items_ids = [neighbor.id for neighbor in results[0]]
         mock_db_results = []
         for item_id in retrieved_items_ids:
+            supabase_lookup_start = datetime.datetime.now() # <--- NEW
             db_result = await supabase.from_("knowledge_items").select("*").eq("id", item_id).execute()
             if db_result["error"]:
+                asyncio.create_task( # <--- NEW
+                    log_performance_metric(
+                        agent_name="knowledge_management_agent",
+                        metric_name=PerformanceMetricName.TOOL_CALL_FAILURE,
+                        value=1.0, user_id=request.user_id,
+                        context={"tool_name": "supabase_lookup", "item_id": item_id, "error": db_result["error"].get("message")}
+                    )
+                )
                 raise ZHeroSupabaseError(agent_name="KnowledgeManagementAgent", message=db_result["error"]["message"], original_error=db_result["error"])
             if db_result["data"]:
                 mock_db_results.append(db_result["data"][0])
+            supabase_lookup_end = datetime.datetime.now() # <--- NEW
+            supabase_lookup_duration_ms = (supabase_lookup_end - supabase_lookup_start).total_seconds() * 1000 # <--- NEW
+            asyncio.create_task( # <--- NEW
+                log_performance_metric(
+                    agent_name="knowledge_management_agent",
+                    metric_name=PerformanceMetricName.TOOL_CALL_SUCCESS,
+                    value=1.0, user_id=request.user_id,
+                    context={"tool_name": "supabase_lookup", "item_id": item_id, "duration_ms": supabase_lookup_duration_ms}
+                )
+            )
 
 
         final_results: List[SearchResult] = []
@@ -184,8 +336,44 @@ async def search_knowledge_semantic(request: KnowledgeSearchQuery): # Uses Pydan
         final_results.sort(key=lambda x: x.score)
 
         logger.info(f"Knowledge Management Agent: Retrieved and formatted {len(final_results)} detailed knowledge items.")
+        
+        end_time = datetime.datetime.now() # <--- NEW
+        total_duration_ms = (end_time - start_time).total_seconds() * 1000 # <--- NEW
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="knowledge_management_agent",
+                metric_name=PerformanceMetricName.KNOWLEDGE_SEARCH_PERFORMED,
+                value=1.0, user_id=request.user_id,
+                context={"query_text": request.query_text, "num_results": len(final_results), "total_duration_ms": total_duration_ms}
+            )
+        )
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="knowledge_management_agent",
+                metric_name=PerformanceMetricName.API_CALL_LATENCY_MS, # <--- NEW
+                value=total_duration_ms, user_id=request.user_id,
+                context={"endpoint": "/search_knowledge_semantic", "type": "api_latency"}
+            )
+        )
+
         return final_results
     except ZHeroException:
+        asyncio.create_task( # <--- NEW - Log search failure before re-raise
+            log_performance_metric(
+                agent_name="knowledge_management_agent",
+                metric_name=PerformanceMetricName.KNOWLEDGE_SEARCH_PERFORMED,
+                value=0.0, user_id=request.user_id,
+                context={"query_text": request.query_text, "error": "ZHeroException"}
+            )
+        )
         raise
     except Exception as e:
+        asyncio.create_task( # <--- NEW - Log search failure before re-raise
+            log_performance_metric(
+                agent_name="knowledge_management_agent",
+                metric_name=PerformanceMetricName.KNOWLEDGE_SEARCH_PERFORMED,
+                value=0.0, user_id=request.user_id,
+                context={"query_text": request.query_text, "error": str(e), "type": "unexpected"}
+            )
+        )
         raise ZHeroAgentError("KnowledgeManagementAgent", "Error during semantic search.", original_error=e)

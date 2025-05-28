@@ -1,4 +1,5 @@
 # agents/orchestration_agent.py
+
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from vertexai.preview.generative_models import GenerativeModel, Part, Tool as GeminiTool
@@ -23,9 +24,12 @@ from zhero_common.exceptions import (
 )
 # NEW: Pub/Sub Publisher instance
 from zhero_common.pubsub_client import pubsub_publisher, initialize_pubsub_publisher
+# NEW: Import metrics helper
+from zhero_common.metrics import log_performance_metric, PerformanceMetricName # <--- NEW
+
 
 # Import the instruction from its location
-from zhero_adk_backend.config.agent_instructions import DEFAULT_ZHERO_CORE_AGENT_INSTRUCTION
+from zhero_adk_backend.config.agent_instructions import DEFAULT_ZHERO_CORE_AGENT_INSTRUCTION # <--- UPDATED PATH
 
 
 app = FastAPI(title="Orchestration Agent")
@@ -54,7 +58,7 @@ orchestration_model: Optional[GenerativeModel] = None
 @app.on_event("startup")
 async def startup_event():
     global orchestration_model
-    # Initialize Pub/Sub Publisher
+    # Initialize Pub/Sub Publisher (this is crucial for metric logging!)
     await initialize_pubsub_publisher()
 
     try:
@@ -62,8 +66,21 @@ async def startup_event():
         aiplatform.init(project=os.environ["GCP_PROJECT_ID"], location=os.environ["VERTEX_AI_LOCATION"])
         orchestration_model = GenerativeModel(os.environ["GEMINI_PRO_MODEL_ID"])
         logger.info("Orchestration Agent: Initialized Gemini model for reasoning.")
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="orchestration_agent",
+                metric_name=PerformanceMetricName.AGENT_STARTUP_SUCCESS
+            )
+        )
     except Exception as e:
         logger.error(f"Orchestration Agent: Failed to initialize Gemini model: {e}", exc_info=True)
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="orchestration_agent",
+                metric_name=PerformanceMetricName.AGENT_STARTUP_FAILURE,
+                context={"error": str(e)}
+            )
+        )
         raise ZHeroVertexAIError("OrchestrationAgent", "Gemini Model", "Failed to initialize Gemini model on startup.", original_error=e)
 
 
@@ -109,7 +126,7 @@ GEMINI_TOOLS = [
     ),
     GeminiTool.from_function(
         func=lambda text_content: tool_client.post(
-            "summarization_tool", "/summarize", {"text_content": {"text_content": text_content}}), # Nested dict for Pydantic
+            "summarization_tool", "/summarize", {"text_content": text_content}), # <--- UPDATED: Adjusted to directly accept dict
         name="summarize_tool",
         description="Condenses long blocks of text into concise summaries. Use for distilling search results.",
         parameters={
@@ -158,6 +175,8 @@ GEMINI_TOOLS = [
 
 @app.post("/orchestrate_query", response_model=AIResponse, summary="Orchestrates a user query across Z-HERO agents and tools")
 async def orchestrate_query(user_query: UserQuery): # Uses Pydantic model for validation
+    start_orchestration_time = datetime.datetime.now() # <--- NEW
+
     if not orchestration_model:
         raise ZHeroDependencyError("OrchestrationAgent", "Gemini Model", "Orchestration model (LLM) not initialized.", 500)
     if pubsub_publisher is None: # Check if Pub/Sub is ready before major operations
@@ -170,32 +189,104 @@ async def orchestrate_query(user_query: UserQuery): # Uses Pydantic model for va
     user_context = {}
     current_sentiment = "neutral"
 
+    profile_fetch_start = datetime.datetime.now() # <--- NEW
     try:
         user_profile_data_res = await agent_client.post("user_profile_agent", "/get_profile", {"user_id": user_query.user_id})
         user_context = user_profile_data_res.get("profile", user_context) # Use user_context as default
         if user_query.user_profile_data:
             user_context.update(user_query.user_profile_data)
         logger.info(f"Orchestration Agent: Fetched user profile for {user_query.user_id}.")
+
+        profile_fetch_end = datetime.datetime.now() # <--- NEW
+        profile_duration_ms = (profile_fetch_end - profile_fetch_start).total_seconds() * 1000 # <--- NEW
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="orchestration_agent",
+                metric_name=PerformanceMetricName.AGENT_API_CALL_SUCCESS, # <--- NEW
+                value=1.0, user_id=user_query.user_id,
+                context={"target_agent": "user_profile_agent", "endpoint": "/get_profile"}
+            )
+        )
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="orchestration_agent",
+                metric_name=PerformanceMetricName.API_CALL_LATENCY_MS, # <--- NEW
+                value=profile_duration_ms, user_id=user_query.user_id,
+                context={"target_agent": "user_profile_agent", "endpoint": "/get_profile"}
+            )
+        )
     except ZHeroException as e:
         logger.warning(f"Orchestration Agent: Could not fetch user profile for {user_query.user_id} due to ZHeroException: {e.message}. Using fallback.", exc_info=True)
         user_context = {"interests": "general knowledge", "style": "informal"}
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="orchestration_agent",
+                metric_name=PerformanceMetricName.AGENT_API_CALL_FAILURE, # <--- NEW
+                value=1.0, user_id=user_query.user_id,
+                context={"target_agent": "user_profile_agent", "endpoint": "/get_profile", "error": e.message}
+            )
+        )
     except Exception as e:
         logger.warning(f"Orchestration Agent: Unexpected error fetching user profile: {e}. Using fallback.", exc_info=True)
         user_context = {"interests": "general knowledge", "style": "informal"}
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="orchestration_agent",
+                metric_name=PerformanceMetricName.AGENT_API_CALL_FAILURE, # <--- NEW
+                value=1.0, user_id=user_query.user_id,
+                context={"target_agent": "user_profile_agent", "endpoint": "/get_profile", "error": str(e), "type": "unexpected"}
+            )
+        )
 
 
+    sentiment_fetch_start = datetime.datetime.now() # <--- NEW
     try:
         sentiment_analysis_res = await agent_client.post("sentiment_analysis_agent", "/analyze", {"text": user_query.query_text, "user_id": user_query.user_id})
         current_sentiment = sentiment_analysis_res.get("sentiment", current_sentiment) # Use current_sentiment as default
         if user_query.sentiment:
             current_sentiment = user_query.sentiment
         logger.info(f"Orchestration Agent: Analyzed sentiment as: {current_sentiment}.")
+
+        sentiment_fetch_end = datetime.datetime.now() # <--- NEW
+        sentiment_duration_ms = (sentiment_fetch_end - sentiment_fetch_start).total_seconds() * 1000 # <--- NEW
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="orchestration_agent",
+                metric_name=PerformanceMetricName.AGENT_API_CALL_SUCCESS, # <--- NEW
+                value=1.0, user_id=user_query.user_id,
+                context={"target_agent": "sentiment_analysis_agent", "endpoint": "/analyze"}
+            )
+        )
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="orchestration_agent",
+                metric_name=PerformanceMetricName.API_CALL_LATENCY_MS, # <--- NEW
+                value=sentiment_duration_ms, user_id=user_query.user_id,
+                context={"target_agent": "sentiment_analysis_agent", "endpoint": "/analyze"}
+            )
+        )
     except ZHeroException as e:
         logger.warning(f"Orchestration Agent: Could not analyze sentiment due to ZHeroException: {e.message}. Using fallback.", exc_info=True)
         current_sentiment = "neutral"
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="orchestration_agent",
+                metric_name=PerformanceMetricName.AGENT_API_CALL_FAILURE, # <--- NEW
+                value=1.0, user_id=user_query.user_id,
+                context={"target_agent": "sentiment_analysis_agent", "endpoint": "/analyze", "error": e.message}
+            )
+        )
     except Exception as e:
         logger.warning(f"Orchestration Agent: Unexpected error analyzing sentiment: {e}. Using fallback.", exc_info=True)
         current_sentiment = "neutral"
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="orchestration_agent",
+                metric_name=PerformanceMetricName.AGENT_API_CALL_FAILURE, # <--- NEW
+                value=1.0, user_id=user_query.user_id,
+                context={"target_agent": "sentiment_analysis_agent", "endpoint": "/analyze", "error": str(e), "type": "unexpected"}
+            )
+        )
 
 
     # 2. LLM-driven Decision Making and Tool Execution
@@ -210,7 +301,7 @@ async def orchestrate_query(user_query: UserQuery): # Uses Pydantic model for va
         "image_url": str(user_query.image_url) if user_query.image_url else "None" # Convert AnyUrl to str
     }
 
-    from zhero_adk_backend.config.agent_instructions import DEFAULT_ZHERO_CORE_AGENT_INSTRUCTION
+    # from zhero_adk_backend.config.agent_instructions import DEFAULT_ZHERO_CORE_AGENT_INSTRUCTION # <--- REMOVED
     formatted_initial_prompt = DEFAULT_ZHERO_CORE_AGENT_INSTRUCTION.format(**orchestration_prompt_context)
 
     final_response_text = "I'm processing your request..."
@@ -223,19 +314,30 @@ async def orchestrate_query(user_query: UserQuery): # Uses Pydantic model for va
     }
 
     try:
-        for _ in range(3):
+        for _ in range(3): # Attempt a few tool-use rounds
+            llm_call_start = datetime.datetime.now() # <--- NEW
             response = await chat_session.send_message_async(
                 formatted_initial_prompt if _ == 0 else "Continue based on previous results. If no more tools needed, just formulate the final response.",
                 tools=GEMINI_TOOLS,
                 generation_config=generation_config
             )
+            llm_call_end = datetime.datetime.now() # <--- NEW
+            llm_duration_ms = (llm_call_end - llm_call_start).total_seconds() * 1000 # <--- NEW
+            asyncio.create_task( # <--- NEW
+                log_performance_metric(
+                    agent_name="orchestration_agent",
+                    metric_name=PerformanceMetricName.GEMINI_GENERATION_SUCCESS, # Assuming generation occurred
+                    value=1.0, user_id=user_query.user_id,
+                    context={"round": _ + 1, "duration_ms": llm_duration_ms, "model": os.environ["GEMINI_PRO_MODEL_ID"]}
+                )
+            )
 
             if response.candidates and response.candidates[0].tool_calls:
                 for tool_call in response.candidates[0].tool_calls:
                     tool_output = None
+                    tool_call_start_time = datetime.datetime.now() # <--- NEW
                     try:
                         if tool_call.function.name == "semantic_knowledge_search":
-                            # Pydantic model is used implicitly by func.
                             search_results_json = await agent_client.post("knowledge_management_agent", "/search_knowledge_semantic", tool_call.function.args)
                             search_results = [SearchResult(**r) for r in search_results_json]
                             knowledge_snippets = []
@@ -249,7 +351,6 @@ async def orchestrate_query(user_query: UserQuery): # Uses Pydantic model for va
                             logger.info(f"Orchestration Agent: Semantic search returned {len(knowledge_snippets)} snippets.")
 
                         elif tool_call.function.name == "web_search":
-                            # Pydantic model is used implicitly by func.
                             web_results_json = await tool_client.post("web_search_tool", "/search", tool_call.function.args)
                             web_results = [WebSearchResult(**r) for r in web_results_json]
                             web_snippets = []
@@ -272,38 +373,61 @@ async def orchestrate_query(user_query: UserQuery): # Uses Pydantic model for va
                             logger.info(f"Orchestration Agent: Web search returned {len(web_snippets)} snippets.")
 
                         elif tool_call.function.name == "ingest_knowledge_item":
-                            # Pydantic model is used implicitly by func.
                             ingest_res = await agent_client.post("knowledge_management_agent", "/ingest_knowledge", tool_call.function.args)
                             tool_output = {"ingest_knowledge_item_result": ingest_res}
 
                         elif tool_call.function.name == "summarize_tool":
-                            # Pydantic model is used implicitly by func.
                             summarization_res = await tool_client.post("summarization_tool", "/summarize", tool_call.function.args)
                             tool_output = {"summarization_result": summarization_res.get("summary")}
 
                         elif tool_call.function.name == "update_user_preference":
-                            # Pydantic model is used implicitly by func.
                             update_res = await agent_client.post("user_profile_agent", "/update_preference", tool_call.function.args)
                             tool_output = {"update_user_preference_result": update_res}
 
                         elif tool_call.function.name == "log_internal_knowledge_gap":
                             # This tool call already publishes to Pub/Sub via pubsub_publisher.publish_message in GEMINI_TOOLS
-                            pass
+                            pass # Nothing to do here for tool_output logging
 
                         elif tool_call.function.name == "process_multimodal_content":
-                            # Pydantic model is used implicitly by func.
                             process_res = await agent_client.post("multimodal_agent", "/process_content", tool_call.function.args)
                             tool_output = {"process_multimodal_content_result": process_res}
 
                         else:
                             tool_output = {"error": f"Unknown tool: {tool_call.function.name}"}
 
+                        tool_call_end_time = datetime.datetime.now() # <--- NEW
+                        tool_duration_ms = (tool_call_end_time - tool_call_start_time).total_seconds() * 1000 # <--- NEW
+                        asyncio.create_task( # <--- NEW
+                            log_performance_metric(
+                                agent_name="orchestration_agent",
+                                metric_name=PerformanceMetricName.TOOL_CALL_SUCCESS, # <--- NEW
+                                value=1.0, user_id=user_query.user_id,
+                                context={"tool_name": tool_call.function.name, "duration_ms": tool_duration_ms, "round": _ + 1}
+                            )
+                        )
+
                     except ZHeroException as e:
                         logger.error(f"Orchestration Agent: Tool call failed with ZHeroException: {tool_call.function.name} - {e.message}", exc_info=True)
                         tool_output = {"error": f"Tool '{tool_call.function.name}' failed: {e.message}"}
+                        asyncio.create_task( # <--- NEW
+                            log_performance_metric(
+                                agent_name="orchestration_agent",
+                                metric_name=PerformanceMetricName.TOOL_CALL_FAILURE, # <--- NEW
+                                value=1.0, user_id=user_query.user_id,
+                                context={"tool_name": tool_call.function.name, "error": e.message, "round": _ + 1}
+                            )
+                        )
                     except Exception as e:
                         logger.error(f"Orchestration Agent: Unexpected error during tool call {tool_call.function.name}: {e}", exc_info=True)
                         tool_output = {"error": f"Tool '{tool_call.function.name}' failed due to unexpected error: {e}"}
+                        asyncio.create_task( # <--- NEW
+                            log_performance_metric(
+                                agent_name="orchestration_agent",
+                                metric_name=PerformanceMetricName.TOOL_CALL_FAILURE, # <--- NEW
+                                value=1.0, user_id=user_query.user_id,
+                                context={"tool_name": tool_call.function.name, "error": str(e), "type": "unexpected", "round": _ + 1}
+                            )
+                        )
 
                     response = await chat_session.send_message_async(
                         Part.from_function_response(name=tool_call.function.name, response=tool_output),
@@ -319,10 +443,34 @@ async def orchestrate_query(user_query: UserQuery): # Uses Pydantic model for va
                 break
 
     except google.api_core.exceptions.InvalidArgument as e:
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="orchestration_agent",
+                metric_name=PerformanceMetricName.GEMINI_GENERATION_FAILURE, # <--- NEW
+                value=1.0, user_id=user_query.user_id,
+                context={"error": str(e), "type": "invalid_argument_to_llm"}
+            )
+        )
         raise ZHeroVertexAIError("OrchestrationAgent", "Gemini Model", "Invalid argument to Gemini API.", original_error=e, status_code=400)
     except ZHeroException:
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="orchestration_agent",
+                metric_name=PerformanceMetricName.GEMINI_GENERATION_FAILURE, # <--- NEW
+                value=1.0, user_id=user_query.user_id,
+                context={"error": "ZHeroException during LLM interaction", "type": "orchestration_failure"}
+            )
+        )
         raise
     except Exception as e:
+        asyncio.create_task( # <--- NEW
+            log_performance_metric(
+                agent_name="orchestration_agent",
+                metric_name=PerformanceMetricName.GEMINI_GENERATION_FAILURE, # <--- NEW
+                value=1.0, user_id=user_query.user_id,
+                context={"error": str(e), "type": "unexpected_orchestration_failure"}
+            )
+        )
         raise ZHeroAgentError("OrchestrationAgent", "An unexpected error occurred during orchestration process.", original_error=e)
 
     if not final_response_text or final_response_text == "I'm sorry, I encountered an issue completing your request.":
@@ -343,30 +491,58 @@ async def orchestrate_query(user_query: UserQuery): # Uses Pydantic model for va
                     ).model_dump(exclude_unset=True) # Ensure it's a dict for httpx
                 )
                 final_response_text = conv_agent_response.get("response_text", "I'm sorry, I couldn't generate a full response.")
+                asyncio.create_task( # <--- NEW
+                    log_performance_metric(
+                        agent_name="orchestration_agent",
+                        metric_name=PerformanceMetricName.AGENT_API_CALL_SUCCESS, # <--- NEW
+                        value=1.0, user_id=user_query.user_id,
+                        context={"target_agent": "conversational_agent", "endpoint": "/generate_response", "fallback_used": True}
+                    )
+                )
             except ZHeroException as e:
                 logger.error(f"Orchestration Agent: Fallback to Conversational Agent failed with ZHeroException: {e.message}", exc_info=True)
                 final_response_text = "I found some information, but I'm having trouble formulating a complete answer."
+                asyncio.create_task( # <--- NEW
+                    log_performance_metric(
+                        agent_name="orchestration_agent",
+                        metric_name=PerformanceMetricName.AGENT_API_CALL_FAILURE, # <--- NEW
+                        value=1.0, user_id=user_query.user_id,
+                        context={"target_agent": "conversational_agent", "endpoint": "/generate_response", "error": e.message, "fallback_used": True}
+                    )
+                )
             except Exception as e:
                 logger.error(f"Orchestration Agent: Fallback to Conversational Agent failed with unexpected error: {e}", exc_info=True)
                 final_response_text = "I found some information, but I'm having trouble formulating a complete answer."
+                asyncio.create_task( # <--- NEW
+                    log_performance_metric(
+                        agent_name="orchestration_agent",
+                        metric_name=PerformanceMetricName.AGENT_API_CALL_FAILURE, # <--- NEW
+                        value=1.0, user_id=user_query.user_id,
+                        context={"target_agent": "conversational_agent", "endpoint": "/generate_response", "error": str(e), "type": "unexpected_fallback", "fallback_used": True}
+                    )
+                )
         else:
             logger.info("Orchestration Agent: No retrieved content and no direct LLM response. Providing generic apology.")
             final_response_text = "I'm sorry, I couldn't find relevant information or generate a response for that."
 
-
-    # Log performance metrics to Pub/Sub (fire-and-forget)
-    if pubsub_publisher:
-        asyncio.create_task(
-            _log_performance_metric_via_pubsub(
-                user_query.user_id,
-                user_query.query_text,
-                len(final_response_text),
-                "orchestration_agent"
-            )
+    end_orchestration_time = datetime.datetime.now() # <--- NEW
+    orchestration_duration_ms = (end_orchestration_time - start_orchestration_time).total_seconds() * 1000 # <--- NEW
+    asyncio.create_task( # <--- NEW
+        log_performance_metric(
+            agent_name="orchestration_agent",
+            metric_name=PerformanceMetricName.QUERY_PROCESSED, # <--- NEW
+            value=1.0, user_id=user_query.user_id,
+            context={"query_text": user_query.query_text, "response_length": len(final_response_text), "duration_ms": orchestration_duration_ms}
         )
-    else:
-        logger.warning("Orchestration Agent: Pub/Sub publisher not initialized. Cannot log performance metric.")
-
+    )
+    asyncio.create_task( # <--- NEW
+        log_performance_metric(
+            agent_name="orchestration_agent",
+            metric_name=PerformanceMetricName.API_CALL_LATENCY_MS, # <--- NEW
+            value=orchestration_duration_ms, user_id=user_query.user_id, # <--- NEW
+            context={"endpoint": "/orchestrate_query", "type": "overall_request_latency"} # <--- NEW
+        )
+    )
 
     return AIResponse(
         user_id=user_query.user_id,
@@ -374,7 +550,7 @@ async def orchestrate_query(user_query: UserQuery): # Uses Pydantic model for va
         source_citations=source_citations
     )
 
-# Helper function for background ingestion via Pub/Sub
+# Helper function for background ingestion via Pub/Sub (KEPT, as it publishes to a different topic)
 async def _ingest_web_result_via_pubsub(user_id: str, content: str, source_url: str, title: str):
     if pubsub_publisher:
         try:
@@ -386,32 +562,38 @@ async def _ingest_web_result_via_pubsub(user_id: str, content: str, source_url: 
                 ).model_dump(exclude_unset=True)
             )
             logger.info(f"Orchestration Agent: Web result queued for ingestion via Pub/Sub: '{title}'")
+            asyncio.create_task( # <--- NEW
+                log_performance_metric(
+                    agent_name="orchestration_agent",
+                    metric_name=PerformanceMetricName.KNOWLEDGE_INGESTED, # <--- NEW
+                    value=1.0, user_id=user_id,
+                    context={"source": "web_search", "title": title}
+                )
+            )
         except ZHeroException as e:
             logger.error(f"Orchestration Agent: Background ingestion failed (ZHeroException): {title} - {e.message}", exc_info=True)
+            asyncio.create_task( # <--- NEW
+                log_performance_metric(
+                    agent_name="orchestration_agent",
+                    metric_name=PerformanceMetricName.KNOWLEDGE_INGESTED, # <--- NEW
+                    value=0.0, user_id=user_id, # Value 0.0 for failure
+                    context={"source": "web_search", "title": title, "error": e.message}
+                )
+            )
         except Exception as e:
             logger.error(f"Orchestration Agent: Background ingestion failed (unexpected): {title} - {e}", exc_info=True)
+            asyncio.create_task( # <--- NEW
+                log_performance_metric(
+                    agent_name="orchestration_agent",
+                    metric_name=PerformanceMetricName.KNOWLEDGE_INGESTED, # <--- NEW
+                    value=0.0, user_id=user_id, # Value 0.0 for failure
+                    context={"source": "web_search", "title": title, "error": str(e), "type": "unexpected"}
+                )
+            )
     else:
         logger.warning(f"Orchestration Agent: Pub/Sub publisher not initialized. Cannot queue web result for ingestion: '{title}'.")
 
 
-# Helper function for logging performance metrics via Pub/Sub
-async def _log_performance_metric_via_pubsub(user_id: str, query_text: str, response_length: int, agent_name: str = "orchestration_agent"):
-    if pubsub_publisher:
-        try:
-            await pubsub_publisher.publish_message(
-                "performance_metrics",
-                AgentPerformanceMetric(
-                    agent_name=agent_name,
-                    user_id=user_id,
-                    metric_name="query_processed",
-                    value=1.0,
-                    context={"query": query_text, "response_length": response_length}
-                ).model_dump(exclude_unset=True)
-            )
-            logger.info(f"Orchestration Agent: Performance metric logged via Pub/Sub for user {user_id}.")
-        except ZHeroException as e:
-            logger.error(f"Orchestration Agent: Failed to log performance metric (ZHeroException): {e.message}", exc_info=True)
-        except Exception as e:
-            logger.error(f"Orchestration Agent: Failed to log performance metric (unexpected): {e}", exc_info=True)
-    else:
-        logger.warning(f"Orchestration Agent: Pub/Sub publisher not initialized. Cannot log performance metric via Pub/Sub for user {user_id}.")
+# REMOVED: Old helper function _log_performance_metric_via_pubsub is no longer needed
+# async def _log_performance_metric_via_pubsub(...):
+#     ...
